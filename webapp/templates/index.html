@@ -1,0 +1,687 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dice Tower Control</title>
+<style>
+  :root {
+    --bg:#14161a; --panel:#1c2027; --edge:#2c323c; --ink:#e6e9ef; --dim:#98a2b3;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#58a6ff;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:10px 16px; border-bottom:1px solid var(--edge); display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.02em; }
+  .pill { font-size:12px; padding:2px 9px; border-radius:99px; border:1px solid var(--edge); color:var(--dim); }
+  .pill.ok { color:var(--ok); border-color:#1d572b; } .pill.bad { color:var(--bad); border-color:#5c2321; }
+  .pill.warn { color:var(--warn); border-color:#5c4711; }
+  nav { display:flex; gap:4px; padding:8px 16px 0; flex-wrap:wrap; }
+  nav button { background:none; border:1px solid transparent; border-bottom:none; color:var(--dim); padding:7px 14px; cursor:pointer; border-radius:6px 6px 0 0; font-size:13px; }
+  nav button.on { background:var(--panel); border-color:var(--edge); color:var(--ink); }
+  main { padding:16px; }
+  section { display:none; } section.on { display:block; }
+  .grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(330px,1fr)); }
+  .card { background:var(--panel); border:1px solid var(--edge); border-radius:9px; padding:13px; }
+  .card h2 { font-size:12px; margin:0 0 10px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); font-weight:600; }
+  button.act { background:#22303f; color:var(--ink); border:1px solid #2f4256; padding:7px 13px; border-radius:6px; cursor:pointer; font-size:13px; }
+  button.act:hover { background:#2a3d52; } button.act:disabled { opacity:.45; cursor:not-allowed; }
+  button.act.p { background:#1f6feb; border-color:#1f6feb; }
+  img.view { width:100%; border-radius:7px; background:#000; display:block; }
+  #calWrap { position:relative; display:inline-block; max-width:100%; }
+  #calWrap canvas { position:absolute; inset:0; cursor:crosshair; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  td,th { padding:4px 7px; border-bottom:1px solid var(--edge); text-align:left; }
+  th { color:var(--dim); font-weight:500; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:12px; }
+  .row { display:flex; gap:9px; align-items:center; flex-wrap:wrap; }
+  label.sl { display:block; margin:9px 0 3px; color:var(--dim); font-size:12px; }
+  input[type=range] { width:100%; }
+  .crops { display:grid; gap:9px; grid-template-columns:repeat(auto-fill,minmax(132px,1fr)); }
+  .crop { border:2px solid var(--edge); border-radius:7px; overflow:hidden; background:#000; }
+  .crop.sus { border-color:#5c2321; } .crop.clean { border-color:#1d572b; }
+  .crop img { width:100%; display:block; }
+  .crop .meta { padding:5px 6px; font-size:11px; background:var(--panel); }
+  .crop input { width:100%; background:#0e1116; color:var(--ink); border:1px solid var(--edge); border-radius:4px; padding:3px 5px; font-size:13px; }
+  .note { color:var(--dim); font-size:12px; margin:7px 0 0; }
+  .banner { padding:9px 12px; border-radius:7px; margin-bottom:13px; font-size:13px; }
+  .banner.warn { background:#3a2d0b; border:1px solid #5c4711; color:#f0d68a; }
+  .banner.bad { background:#3a1614; border:1px solid #5c2321; color:#ffb3ae; }
+  .empty { color:var(--dim); font-size:13px; padding:20px; text-align:center; border:1px dashed var(--edge); border-radius:7px; }
+  code { background:#0e1116; padding:1px 5px; border-radius:4px; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Dice Tower Control</h1>
+  <span class="pill" id="pPi">pi …</span>
+  <span class="pill" id="pTune">tuning …</span>
+  <span class="pill" id="pOll">ollama …</span>
+  <span class="pill" id="pAnth">anthropic …</span>
+  <span class="pill" id="pCal">calibration …</span>
+  <span style="flex:1"></span>
+  <button class="act" onclick="refreshStatus()">refresh</button>
+</header>
+
+<nav>
+  <button class="on" data-t="mount">Mount</button>
+  <button data-t="detect">Detect</button>
+  <button data-t="label">Label</button>
+  <button data-t="runtime">Runtime</button>
+  <button data-t="settings">Settings</button>
+</nav>
+
+<main>
+<div id="banners"></div>
+
+<!-- ------------------------------------------------------------- MOUNT -->
+<section id="mount" class="on">
+  <div class="grid">
+    <div class="card">
+      <h2>Live preview</h2>
+      <img class="view" id="live" alt="live preview">
+      <p class="note">Streamed straight from the Pi, not proxied — keeps latency
+        low while you physically adjust the mount.</p>
+      <div class="row" style="margin-top:9px">
+        <button class="act" onclick="startLive()">start</button>
+        <button class="act" onclick="stopLive()">stop</button>
+        <button class="act" onclick="piPost('lock').then(refreshStatus)">lock exposure</button>
+        <button class="act" onclick="piPost('unlock').then(refreshStatus)">unlock</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Tray calibration</h2>
+      <p class="note" style="margin-top:0">Click the four corners of the tray
+        <b>floor</b>, in any order. Auto-detection is not used: a dark matte tray
+        on a dark desk spans ~14 grey levels, which defeats it. The camera is
+        fixed once mounted, so this is a one-time measurement.</p>
+      <div class="row" style="margin:9px 0">
+        <button class="act p" onclick="loadCal()">load snapshot</button>
+        <button class="act" onclick="clearPts()">clear points</button>
+        <button class="act" id="saveCal" disabled onclick="saveCal()">save (0/4)</button>
+      </div>
+      <div id="calWrap"><img class="view" id="calImg" alt=""><canvas id="calCv"></canvas></div>
+    </div>
+
+    <div class="card">
+      <h2>Framing &amp; uniformity</h2>
+      <button class="act" onclick="framing()">check framing</button>
+      <div id="framingOut" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Camera controls</h2>
+      <table id="ctrlTable"><tbody><tr><td class="note">load status…</td></tr></tbody></table>
+    </div>
+  </div>
+</section>
+
+<!-- ------------------------------------------------------------ DETECT -->
+<section id="detect">
+  <div class="grid">
+    <div class="card">
+      <h2>Detection parameters</h2>
+      <label class="sl">variance window — blank = scales with tray size</label>
+      <input id="pWindow" class="mono" placeholder="auto" style="width:100%;background:#0e1116;color:var(--ink);border:1px solid var(--edge);border-radius:5px;padding:5px">
+      <label class="sl">min blob area — <span id="vMin">0.20</span>% of tray</label>
+      <input type="range" id="pMin" min="1" max="30" value="20">
+      <label class="sl">max blob area — <span id="vMax">6.0</span>% of tray</label>
+      <input type="range" id="pMax" min="10" max="200" value="60">
+      <label class="sl">crop context — <span id="vCtx">1.5</span>× the bounding box</label>
+      <input type="range" id="pCtx" min="10" max="50" value="15">
+      <p class="note">Both ends fail, for different reasons. Too tight and the
+        crop is a numeral with no die around it — a reader cannot tell which
+        face is up. Too wide and the crop contains several dice, so there is no
+        single right answer. If no value works, the detection is bounding
+        digits rather than dice, which is a <i>lighting</i> problem.</p>
+      <label class="sl"><input type="checkbox" id="pSplit" checked> watershed split for touching dice</label>
+      <p class="note">The split only applies if it increases the number of
+        <i>clean single dice</i>. It will refuse otherwise — watershed
+        over-segments happily, and more blobs is not the goal.</p>
+      <div class="row" style="margin-top:11px">
+        <button class="act p" onclick="capture()">capture &amp; detect</button>
+        <button class="act" onclick="reanalyze()">re-detect last</button>
+      </div>
+      <p class="note" id="detStatus"></p>
+    </div>
+
+    <div class="card" style="grid-column:1/-1">
+      <h2>Result</h2>
+      <div id="detSummary"></div>
+      <img class="view" id="overlay" style="margin-top:10px" alt="">
+    </div>
+
+    <div class="card" style="grid-column:1/-1">
+      <h2>Crops</h2>
+      <div id="detCrops" class="crops"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ------------------------------------------------------------- LABEL -->
+<section id="label">
+  <div class="card">
+    <h2>Labelling</h2>
+    <div class="row">
+      <button class="act p" onclick="suggestAll()">suggest all</button>
+      <select id="labelProvider" style="background:#0e1116;color:var(--ink);border:1px solid var(--edge);border-radius:6px;padding:6px">
+        <option value="">auto: Claude Code, then Anthropic, then Ollama</option>
+        <option value="claude-code">Claude Code</option>
+        <option value="anthropic">Anthropic API</option>
+        <option value="ollama">Ollama ({{ vision_model }})</option>
+      </select>
+      <button class="act" onclick="saveAllLabels()">save all</button>
+      <span class="note" id="labelStatus"></span>
+    </div>
+    <p class="note">Claude Code is slow per die (~10s haiku, ~105s opus) but far more
+      accurate on die TYPE; Ollama answers in ~1s and calls every d12 a d10. For building a
+      labelled set, accuracy matters more than speed.<br>
+      Suggestions are <b>pre-labels, not ground truth</b> — the
+      model has been verified on two crops only. Every value needs your eyes on
+      it before it becomes training data. Labels append to
+      <code>dataset/labels.jsonl</code>; corrections are just another append.</p>
+  </div>
+  <div class="card" style="margin-top:14px">
+    <div id="labelCrops" class="crops"></div>
+  </div>
+</section>
+
+<!-- ----------------------------------------------------------- RUNTIME -->
+<section id="runtime">
+  <div class="grid">
+    <div class="card" style="grid-column:1/-1">
+      <h2>Read a roll</h2>
+      <div class="row">
+        <button class="act p" onclick="readRoll()">read roll now</button>
+        <select id="rollProvider" style="background:#0e1116;color:var(--ink);border:1px solid var(--edge);border-radius:6px;padding:6px">
+          <option value="">auto: Claude Code, then Anthropic, then Ollama</option>
+          <option value="claude-code">Claude Code</option>
+          <option value="anthropic">Anthropic API</option>
+          <option value="ollama">Ollama (local)</option>
+        </select>
+        <span class="note" id="rollStatus"></span>
+      </div>
+      <p class="note">Pi captures and counts; <code>{{ vision_model }}</code>
+        reads. Three <b>different</b> prompts are used, not three repeats —
+        at temperature 0 the same prompt returns identical output every time, so
+        repetition proves nothing. Confidence comes from where the prompts
+        disagree and from the camera's independent count, never from the model's
+        own confidence claim, which was measured to say "high" on a die it could
+        not see.</p>
+      <div id="rollOut" style="margin-top:12px"></div>
+    </div>
+    <div class="card">
+      <h2>Tray image sent to the reader</h2>
+      <img class="view" id="rollImg" alt="">
+    </div>
+    <div class="card">
+      <h2>Recent rolls</h2>
+      <div id="rollLog"><span class="note">none yet</span></div>
+    </div>
+    <div class="card">
+      <h2>Settle detection</h2>
+      <div class="empty">Not implemented.<br><br>Rolls are read on demand. For
+        hands-free operation the Pi needs frame-differencing so a roll fires
+        once the dice stop moving.</div>
+    </div>
+    <div class="card">
+      <h2>Pipeline reality check</h2>
+      <table class="mono">
+        <tr><th>capture + lock</th><td style="color:var(--ok)">working</td></tr>
+        <tr><th>tray calibration</th><td style="color:var(--ok)">working</td></tr>
+        <tr><th>dice detection</th><td style="color:var(--ok)">working</td></tr>
+        <tr><th>touching dice</th><td style="color:var(--warn)">split built, rejects on current data</td></tr>
+        <tr><th>value reading</th><td style="color:var(--warn)">gemma3 on demand only</td></tr>
+        <tr><th>settle detection</th><td style="color:var(--bad)">not built</td></tr>
+        <tr><th>IR lighting test</th><td style="color:var(--bad)">awaiting 850nm illuminator</td></tr>
+        <tr><th>final mount</th><td style="color:var(--bad)">not built</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ---------------------------------------------------------- SETTINGS -->
+<section id="settings">
+  <div class="grid">
+    <div class="card">
+      <h2>Claude Code &mdash; token &amp; model <span id="ccBadge" class="pill"></span></h2>
+      <div id="codeState" class="note">loading...</div>
+      <label class="sl">CLAUDE_CODE_OAUTH_TOKEN (sk-ant-oat...)</label>
+      <input type="password" id="codeInput" autocomplete="off" placeholder="sk-ant-oat..."
+             style="width:100%;background:#0e1116;color:var(--ink);border:1px solid var(--edge);border-radius:5px;padding:7px;font-family:ui-monospace,monospace">
+      <label class="sl">Claude Code model</label>
+      <input id="codeModelInput" list="codeModelList" placeholder="claude-opus-5" autocomplete="off"
+             style="width:100%;background:#0e1116;color:var(--ink);border:1px solid var(--edge);border-radius:5px;padding:7px;font-family:ui-monospace,monospace">
+      <datalist id="codeModelList">
+        <option value="claude-opus-5">most accurate here - 4/4 d12 and d20 correct, ~105s</option>
+        <option value="claude-haiku-4-5">~10x faster, ~10s - got 2 of 4 d12s wrong</option>
+        <option value="claude-sonnet-5">untested here</option>
+        <option value="opus">alias for the latest opus</option>
+        <option value="sonnet">alias for the latest sonnet</option>
+        <option value="haiku">alias for the latest haiku</option>
+      </datalist>
+      <p class="note">Unlike the API path there is <b>no list to query</b> - the CLI has no
+        models subcommand, only <code>--model</code> taking an alias or a full name. These
+        are known-good options, not an authoritative list, so <b>test</b> is the real check:
+        it runs a trivial prompt and proves the token and the model together.</p>
+      <p class="note">Runs <code>claude -p</code> as a subprocess with Read enabled so it
+        can open the tray image, every other tool refused by name, MCP pinned empty, and a
+        working directory holding nothing but that one image.
+        <b>Measured: opus is the only provider that got the d12/d20 split right</b>
+        (4 and 4 on an 8-dice tray) - but it takes ~105s. Haiku takes ~10s and got two of
+        four wrong.</p>
+      <div class="row" style="margin-top:9px">
+        <button class="act p" onclick="saveCode()">save token</button>
+        <button class="act" onclick="saveCodeModel()">save Claude Code model</button>
+        <button class="act" onclick="testCode()">test token + model</button>
+      </div>
+      <p class="note" id="codeMsg"></p>
+    </div>
+
+    <div class="card">
+      <h2>Anthropic API &mdash; key <span id="apiBadge" class="pill"></span></h2>
+      <div id="keyState" class="note">loading...</div>
+      <label class="sl">API key (sk-ant-api...)</label>
+      <input type="password" id="keyInput" autocomplete="off" placeholder="sk-ant-api..."
+             style="width:100%;background:#0e1116;color:var(--ink);border:1px solid var(--edge);border-radius:5px;padding:7px;font-family:ui-monospace,monospace">
+      <p class="note">Stored in <code id="keyPath">~/.dicecam/settings.json</code> -
+        deliberately outside the project directory, so it cannot be swept up by a commit.
+        Never shown again after saving and never returned by the API; only whether one
+        exists and where it came from.</p>
+      <div class="row" style="margin-top:9px">
+        <button class="act p" onclick="saveKey()">save key</button>
+        <button class="act" onclick="testKey()">test it</button>
+        <button class="act" onclick="clearKey()">clear stored key</button>
+      </div>
+      <p class="note" id="keyMsg"></p>
+    </div>
+
+    <div class="card">
+      <h2>Anthropic API &mdash; model <span id="apiModelBadge" class="pill"></span></h2>
+      <label class="sl">Model</label>
+      <input id="modelInput" list="modelList" placeholder="claude-opus-5" autocomplete="off"
+             style="width:100%;background:#0e1116;color:var(--ink);border:1px solid var(--edge);border-radius:5px;padding:7px;font-family:ui-monospace,monospace">
+      <datalist id="modelList"></datalist>
+      <p class="note" id="modelListNote">This list is fetched from the Messages API and
+        needs an <code>sk-ant-api</code> key. A Claude Code OAuth token cannot load it -
+        different service. If you are reading via Claude Code, set the model in the card
+        above instead; this one only applies to the Anthropic API provider.</p>
+      <label class="sl">Effort (ignored for haiku models)</label>
+      <select id="effortInput" style="width:100%;background:#0e1116;color:var(--ink);border:1px solid var(--edge);border-radius:6px;padding:7px">
+        <option value="low">low</option><option value="medium">medium</option><option value="high">high</option>
+      </select>
+      <div class="row" style="margin-top:11px">
+        <button class="act" onclick="loadModels()">load available models</button>
+        <button class="act p" onclick="saveModel()">save Anthropic API model</button>
+      </div>
+      <p class="note" id="modelMsg"></p>
+    </div>
+
+    <div class="card" style="grid-column:1/-1">
+      <h2>Two credentials, easily confused</h2>
+      <p class="note" style="margin-top:0"><code>sk-ant-oat...</code> is a <b>Claude Code
+        OAuth token</b> and drives <code>claude -p</code> as a subprocess.
+        <code>sk-ant-api...</code> is an <b>API key</b> for the <code>x-api-key</code>
+        header of the Messages API. Both come from Anthropic, both start
+        <code>sk-ant-</code>, and pasting the OAuth token into the API-key field returns
+        <code>401 invalid x-api-key</code> - which reads like a bad key rather than the
+        right credential at the wrong door. So a credential is filed by <b>what it is</b>,
+        not by which box it was typed into; swap them and it is routed correctly and says
+        so.</p>
+      <p class="note">Precedence is environment, then the value saved here, then the
+        default. <code>ANTHROPIC_API_KEY</code> in the environment is the kill switch: if a
+        key leaks the fix has to be "set the variable, restart", and that only works if the
+        environment cannot be silently outranked by something this page can write.</p>
+    </div>
+  </div>
+</section>
+</main>
+
+<script>
+const PI = {{ pi_base|tojson }};
+let lastId = null, lastCrops = [], pts = [], calNat = null, suggestions = {};
+
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.remove('on'));
+  document.querySelectorAll('section').forEach(x => x.classList.remove('on'));
+  b.classList.add('on');
+  document.getElementById(b.dataset.t).classList.add('on');
+});
+pMin.oninput = () => vMin.textContent = (pMin.value/100).toFixed(2);
+pMax.oninput = () => vMax.textContent = (pMax.value/10).toFixed(1);
+pCtx.oninput = () => vCtx.textContent = (pCtx.value/10).toFixed(1);
+
+const j = async (u,o) => (await fetch(u,o)).json();
+const piPost = (e,b={}) => j('/api/pi/'+e,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+const piGet  = e => j('/api/pi/'+e);
+
+function setPill(el,text,cls){ el.textContent=text; el.className='pill '+(cls||''); }
+
+async function refreshStatus(){
+  const s = await j('/api/status');
+  const B = [];
+  if (s.pi_error){ setPill(pPi,'pi unreachable','bad'); setPill(pTune,'tuning ?',''); setPill(pCal,'calibration ?','');
+    B.push(`<div class="banner bad">Camera service unreachable at ${s.pi_base} — ${s.pi_error}<br>
+      Start it: <code>ssh paul@10.0.0.23 '~/pi-tower/run_camera_service.sh'</code></div>`);
+  } else {
+    const p = s.pi;
+    setPill(pPi, p.ok?'pi ok':'pi no frame', p.ok?'ok':'warn');
+    setPill(pTune, p.noir_tuning_active?'NoIR tuning':'WRONG tuning', p.noir_tuning_active?'ok':'warn');
+    setPill(pCal, p.calibrated?'calibrated':'not calibrated', p.calibrated?'ok':'warn');
+    if (p.tuning_warning) B.push(`<div class="banner warn"><b>Colour pipeline:</b> ${p.tuning_warning}</div>`);
+    if (!p.calibrated) B.push(`<div class="banner warn">No tray calibration. Detection and cropping are disabled until the tray quad is set — see the Mount tab.</div>`);
+    if (p.controls && !p.controls.locked) B.push(`<div class="banner warn">Exposure is <b>not locked</b>. Auto-exposure drift makes captures inconsistent and will produce false positives in settle detection later.</div>`);
+    if (p.controls && p.controls.lock_stale) B.push(`<div class="banner bad"><b>Stale exposure lock:</b> ${p.controls.lock_stale}</div>`);
+    const c = p.controls || {};
+    ctrlTable.innerHTML = `<tbody>
+      <tr><th>exposure</th><td class="mono">${c.exposure_us??'?'} µs</td></tr>
+      <tr><th>analogue gain</th><td class="mono">${c.analogue_gain??'?'}</td></tr>
+      <tr><th>colour gains</th><td class="mono">${c.colour_gains?c.colour_gains.join(', '):'?'}</td></tr>
+      <tr><th>lux</th><td class="mono">${c.lux??'?'}</td></tr>
+      <tr><th>AE/AWB</th><td class="mono" style="color:${c.locked?'var(--ok)':'var(--warn)'}">${c.locked?'LOCKED':'auto (drifting)'}</td></tr>
+      <tr><th>tuning</th><td class="mono">${(p.tuning_file||'').split('/').pop()}</td></tr></tbody>`;
+  }
+  if (s.ollama_error) setPill(pOll,'ollama down','bad');
+  else setPill(pOll, s.ollama.vision_available?'gemma3 vision':'no vision model', s.ollama.vision_available?'ok':'warn');
+  const a = s.anthropic || {};
+  const lbl = a.code_token_present ? 'claude code ('+(a.code_token_source||'?')+')'
+            : a.key_present ? 'anthropic ('+(a.key_source||'?')+')'
+            : 'no anthropic credential';
+  setPill(pAnth, lbl, (a.code_token_present||a.key_present) ? 'ok' : 'warn');
+  banners.innerHTML = B.join('');
+}
+
+function startLive(){ live.src = PI + '/stream?t=' + Date.now(); }
+function stopLive(){ live.src = ''; }
+
+async function loadCal(){
+  calImg.onload = () => {
+    calNat = [calImg.naturalWidth, calImg.naturalHeight];
+    calCv.width = calImg.clientWidth; calCv.height = calImg.clientHeight;
+    pts = []; drawPts();
+  };
+  calImg.src = PI + '/snapshot.jpg?t=' + Date.now();
+  const cur = await piGet('calibration');
+  if (cur.calibrated) document.getElementById('saveCal').textContent = 'save (0/4) — replaces existing';
+}
+calCv.onclick = e => {
+  if (pts.length >= 4) return;
+  const r = calCv.getBoundingClientRect();
+  pts.push([e.clientX - r.left, e.clientY - r.top]); drawPts();
+};
+function clearPts(){ pts = []; drawPts(); }
+function drawPts(){
+  const x = calCv.getContext('2d');
+  x.clearRect(0,0,calCv.width,calCv.height);
+  x.strokeStyle='#58a6ff'; x.fillStyle='#58a6ff'; x.lineWidth=2;
+  pts.forEach((p,i)=>{ x.beginPath(); x.arc(p[0],p[1],6,0,7); x.fill();
+    x.fillText(i+1, p[0]+9, p[1]-7); });
+  if (pts.length>1){ x.beginPath(); x.moveTo(pts[0][0],pts[0][1]);
+    pts.slice(1).forEach(p=>x.lineTo(p[0],p[1]));
+    if (pts.length===4) x.closePath(); x.stroke(); }
+  const b = document.getElementById('saveCal');
+  b.textContent = `save (${pts.length}/4)`; b.disabled = pts.length !== 4;
+}
+async function saveCal(){
+  // Clicks are in displayed pixels; the Pi stores tray coords in sensor pixels.
+  // Scale here and send the frame size with it, so the Pi can rescale the quad
+  // if it is ever applied to a different capture resolution.
+  const sx = calNat[0]/calCv.width, sy = calNat[1]/calCv.height;
+  const quad = pts.map(p => [Math.round(p[0]*sx), Math.round(p[1]*sy)]);
+  const r = await piPost('calibration', {quad, frame: calNat});
+  document.getElementById('saveCal').textContent = r.saved ? 'saved ✓' : 'failed';
+  refreshStatus();
+}
+
+async function framing(){
+  framingOut.innerHTML = '<span class="note">measuring…</span>';
+  const f = await piGet('framing');
+  if (f.error){ framingOut.innerHTML = `<div class="banner bad">${f.error}</div>`; return; }
+  const m = f.margins_pct, cut = Object.entries(m).filter(([,v])=>v<0.5).map(([k])=>k);
+  let h = `<table><tr><th>tray coverage</th><td class="mono">${f.coverage_pct}% of frame</td></tr>`;
+  for (const [k,v] of Object.entries(m))
+    h += `<tr><th>margin ${k}</th><td class="mono" style="color:${v<0.5?'var(--bad)':v<3?'var(--warn)':'var(--ink)'}">${v}%</td></tr>`;
+  h += '</table>';
+  if (cut.length) h += `<div class="banner bad" style="margin-top:9px">Tray touches the frame edge at ${cut.join(', ')} — dice there will be clipped.</div>`;
+  h += '<table style="margin-top:10px"><tr><th></th><th>bright</th><th>vs centre</th><th>sharp</th></tr>';
+  const C = f.centre;
+  h += `<tr><th>centre</th><td class="mono">${C.mean}</td><td>—</td><td class="mono">${C.sharp}</td></tr>`;
+  let flat = 0;
+  for (const [k,v] of Object.entries(f.corners)){
+    if(!v){ h+=`<tr><th>${k}</th><td colspan="3" class="note">outside frame</td></tr>`; continue; }
+    const rb = Math.round(100*v.mean/C.mean);
+    const isFlat = v.std < f.flat_std_threshold; if(isFlat) flat++;
+    h += `<tr><th>${k}</th><td class="mono">${v.mean}</td>
+      <td class="mono" style="color:${rb<60?'var(--warn)':'var(--ink)'}">${rb}%</td>
+      <td class="mono">${isFlat?'<span class="note">flat — nothing to resolve</span>':v.sharp}</td></tr>`;
+  }
+  h += '</table>';
+  if (flat) h += `<p class="note">${flat} corner(s) have no detail, so no focus verdict is given —
+    a sharpness number there would be meaningless. Put a die in each corner and re-check.</p>`;
+  framingOut.innerHTML = h;
+}
+
+async function capture(){
+  detStatus.textContent = 'capturing…';
+  const c = await piPost('capture');
+  if (c.error){ detStatus.textContent = c.error; return; }
+  lastId = c.id; await runAnalyze();
+}
+async function reanalyze(){
+  if (!lastId){ detStatus.textContent = 'nothing captured yet'; return; }
+  await runAnalyze();
+}
+async function runAnalyze(){
+  detStatus.textContent = 'detecting… (a few seconds on a Pi 3)';
+  const body = { id: lastId, min_frac: pMin.value/10000, max_frac: pMax.value/1000,
+                 split: pSplit.checked, context: pCtx.value/10 };
+  if (pWindow.value.trim()) body.window = parseInt(pWindow.value);
+  const r = await piPost('analyze', body);
+  if (r.error){ detStatus.textContent = r.error;
+    detSummary.innerHTML = `<div class="banner bad">${r.error}</div>`; return; }
+  detStatus.textContent = '';
+  detSummary.innerHTML = `<table>
+    <tr><th>blobs</th><td class="mono">${r.detections.length}</td></tr>
+    <tr><th>clean</th><td class="mono" style="color:var(--ok)">${r.clean}</td></tr>
+    <tr><th>suspect</th><td class="mono" style="color:var(--warn)">${r.suspect}</td></tr>
+    <tr><th>rejected</th><td class="mono">${r.rejected.too_small} too small, ${r.rejected.too_large} too large</td></tr>
+    <tr><th>watershed</th><td class="mono">${r.split || 'n/a'}</td></tr></table>`;
+  overlay.src = PI + '/file/' + r.overlay + '?t=' + Date.now();
+  lastCrops = r.crops; suggestions = {};
+  renderCrops(detCrops, false); renderCrops(labelCrops, true);
+}
+
+function renderCrops(el, editable){
+  if (!lastCrops.length){ el.innerHTML = '<div class="empty">No crops yet — capture and detect first.</div>'; return; }
+  el.innerHTML = lastCrops.map(c => {
+    const s = suggestions[c.file];
+    return `<div class="crop ${c.suspect?'sus':'clean'}">
+      <img src="${PI}/file/${c.file}" title="${(c.reasons||[]).join('; ')}">
+      <div class="meta">#${c.id} ${c.suspect?'<span style="color:#f85149">suspect</span>':'<span style="color:#3fb950">clean</span>'}
+      ${editable ? `<input id="lb_${c.id}" placeholder="value" value="${s&&s.value!=null?s.value:''}">
+        ${s?`<div class="note" style="margin:2px 0 0">${s.provider||'?'}: ${s.raw} (${s.seconds}s)</div>`:''}` : ''}
+      </div></div>`;
+  }).join('');
+}
+
+async function suggestAll(){
+  if (!lastCrops.length){ labelStatus.textContent = 'no crops — capture first'; return; }
+  for (const c of lastCrops){
+    labelStatus.textContent = `reading ${c.file}…`;
+    const r = await j('/api/suggest',{method:'POST',headers:{'Content-Type':'application/json'},
+                                     body:JSON.stringify({crop:c.file,
+                                                          provider: labelProvider.value || null})});
+    if (!r.error) suggestions[c.file] = r;
+    renderCrops(labelCrops, true);
+  }
+  labelStatus.textContent = 'suggestions in — check every one before saving.';
+}
+
+async function saveAllLabels(){
+  let n = 0;
+  for (const c of lastCrops){
+    const el = document.getElementById('lb_'+c.id);
+    if (!el || !el.value.trim()) continue;
+    await j('/api/label',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({crop:c.file, label:el.value.trim(), source:lastId,
+                           suggested:(suggestions[c.file]||{}).value})});
+    n++;
+  }
+  labelStatus.textContent = `saved ${n} label(s) to dataset/labels.jsonl`;
+}
+
+async function readRoll(){
+  rollStatus.textContent = 'capturing, counting, reading (3 prompts)…';
+  rollOut.innerHTML = '';
+  const r = await j('/api/roll',{method:'POST',headers:{'Content-Type':'application/json'},
+                                 body:JSON.stringify({provider: rollProvider.value || null})});
+  if (r.error){ rollStatus.textContent=''; rollOut.innerHTML = `<div class="banner bad">${r.error}</div>`; return; }
+  rollStatus.textContent = `${r.seconds}s`;
+  rollImg.src = PI + '/file/' + r.capture.tray_image + '?t=' + Date.now();
+
+  let h = '';
+  (r.issues||[]).forEach(i => h += `<div class="banner bad">${i}</div>`);
+  const lows = r.dice.filter(d=>d.confidence==='low').length;
+  if (!r.issues.length && !lows) h += `<div class="banner" style="background:#0f2f16;border:1px solid #1d572b;color:#7ee787">All ${r.total} dice agreed across every reading.</div>`;
+
+  h += `<table><tr><th>value</th><th>confidence</th><th>seen in</th><th></th></tr>`;
+  r.dice.forEach(d => {
+    h += `<tr><td class="mono" style="font-size:18px">${d.value}</td>
+      <td style="color:${d.confidence==='high'?'var(--ok)':'var(--warn)'}">${d.confidence}</td>
+      <td class="mono">${d.seen_in}</td>
+      <td class="note">${d.note||''}</td></tr>`;
+  });
+  for (let i=0;i<r.unresolved;i++)
+    h += `<tr><td class="mono" style="font-size:18px;color:var(--warn)">?</td>
+      <td style="color:var(--warn)">unresolved</td><td class="mono">—</td>
+      <td class="note">readings disagree; candidates ${Object.keys(r.disputed||{}).join(', ')||'—'}</td></tr>`;
+  h += `</table>`;
+  h += `<table style="margin-top:10px"><tr><th>read by</th><td class="mono">${r.provider||'?'} / ${r.model||'?'}</td></tr>
+        <tr><th>camera counted</th><td class="mono">${r.pi_count} dice</td></tr>
+        <tr><th>readings suggest</th><td class="mono">${r.expected_dice}</td></tr>
+        <tr><th>read confidently</th><td class="mono">${r.total}</td></tr>
+        <tr><th>agreement</th><td class="mono">${Math.round(r.agreement*100)}%</td></tr></table>`;
+  h += `<p class="note" style="margin-top:8px">Per-prompt readings — disagreement here is the signal:</p><table>`;
+  r.variant_names.forEach((n,i) => {
+    const v = r.per_variant[i];
+    h += `<tr><th>${n}</th><td class="mono">${v ? '['+v.join(', ')+']' : '<span style="color:var(--bad)">unparsed</span>'}</td></tr>`;
+  });
+  h += `</table>`;
+  rollOut.innerHTML = h;
+  loadRolls();
+}
+
+async function loadRolls(){
+  const rows = await j('/api/rolls');
+  if (!rows.length){ rollLog.innerHTML = '<span class="note">none yet</span>'; return; }
+  rollLog.innerHTML = '<table>' + rows.map(x =>
+    `<tr><td class="mono">${(x.ts||'').replace('T',' ').slice(5)}</td>
+     <td class="mono">[${(x.values||[]).join(', ')}]</td>
+     <td style="color:${(x.issues&&x.issues.length)?'var(--warn)':'var(--ok)'}">${(x.issues&&x.issues.length)?'flagged':'ok'}</td></tr>`
+  ).join('') + '</table>';
+}
+
+
+async function loadSettings(){
+  const s = await j('/api/settings');
+  keyPath.textContent = s.path;
+  modelInput.value = s.anthropic_model || '';
+  effortInput.value = s.anthropic_effort || 'low';
+  codeModelInput.value = s.claude_code_model || '';
+  keyState.innerHTML = !s.key_present
+    ? '<span style="color:var(--warn)">No API key configured.</span>'
+    : s.key_source === 'environment'
+      ? '<span style="color:var(--ok)">Key set from the ENVIRONMENT.</span> <span class="note">It outranks anything saved here.</span>'
+      : '<span style="color:var(--ok)">Key configured (saved in this app).</span>';
+  codeState.innerHTML = s.code_token_present
+    ? '<span style="color:var(--ok)">Token configured (' + s.code_token_source + ').</span>'
+    : '<span style="color:var(--warn)">No Claude Code token configured.</span>';
+  if (s.key_present && !modelList.children.length) loadModels();
+
+  // Which provider will a roll actually use? Auto order is claude-code, then
+  // anthropic, then ollama. Say so on the cards, because a model typed into the
+  // card that is not in force looks broken rather than inapplicable.
+  const active = s.code_token_present ? 'claude-code' : s.key_present ? 'anthropic' : 'ollama';
+  const on  = 'pill ok', off = 'pill warn';
+  ccBadge.className = active === 'claude-code' ? on : off;
+  ccBadge.textContent = active === 'claude-code' ? 'IN USE' : 'not in use';
+  apiBadge.className = active === 'anthropic' ? on : off;
+  apiBadge.textContent = active === 'anthropic' ? 'IN USE' : 'not in use';
+  apiModelBadge.className = apiBadge.className;
+  apiModelBadge.textContent = active === 'anthropic'
+    ? 'IN USE' : 'no effect while reading via ' + active;
+}
+async function saveKey(){
+  const v = keyInput.value.trim();
+  if (!v){ keyMsg.textContent = 'nothing entered'; return; }
+  const r = await j('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+                                     body:JSON.stringify({anthropic_key:v})});
+  keyInput.value = '';
+  keyMsg.innerHTML = (r.routed && r.routed.kind === 'claude-code')
+    ? '<span style="color:var(--warn)">That is a <b>Claude Code OAuth token</b>, not an API key - both start sk-ant- but they open different doors. Filed as the Claude Code token, which is where it actually works.</span>'
+    : 'saved. Use "test it" to confirm it works.';
+  loadSettings(); refreshStatus();
+}
+async function clearKey(){
+  await j('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+                           body:JSON.stringify({anthropic_key:''})});
+  keyInput.value=''; keyMsg.textContent='stored key removed.'; loadSettings(); refreshStatus();
+}
+async function testKey(){
+  keyMsg.textContent = 'testing...';
+  const r = await j('/api/settings/test',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  keyMsg.innerHTML = r.ok
+    ? '<span style="color:var(--ok)">Works - authenticated against ' + r.model + '.</span>'
+    : '<span style="color:var(--bad)">Failed' + (r.status?' ('+r.status+')':'') + ': ' + (r.error||'unknown') + '</span>';
+}
+async function saveCode(){
+  const v = codeInput.value.trim();
+  if (!v){ codeMsg.textContent='nothing entered'; return; }
+  const r = await j('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+                                     body:JSON.stringify({claude_code_token:v})});
+  codeInput.value='';
+  codeMsg.innerHTML = (r.routed && r.routed.stored_as !== 'claude_code_token')
+    ? '<span style="color:var(--warn)">That looks like an <b>' + r.routed.kind + '</b> credential, so it was filed as the API key instead.</span>'
+    : 'saved.';
+  loadSettings(); refreshStatus();
+}
+async function testCode(){
+  codeMsg.textContent = 'running a trivial prompt (can take ~30s)...';
+  const r = await j('/api/settings/code_test',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({model: codeModelInput.value.trim() || null})});
+  codeMsg.innerHTML = r.ok
+    ? '<span style="color:var(--ok)">Works - ' + r.model + ' replied in ' + r.seconds + 's.</span>'
+    : '<span style="color:var(--bad)">Failed: ' + (r.error||'unknown') + '</span>';
+}
+async function saveCodeModel(){
+  await j('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({claude_code_model:codeModelInput.value.trim()})});
+  codeMsg.textContent='model saved.'; loadSettings();
+}
+async function loadModels(){
+  modelListNote.textContent = 'asking the API...';
+  const r = await j('/api/settings/models');
+  if (!r.ok){
+    modelListNote.innerHTML = '<span style="color:var(--warn)">Could not load the list'
+      + (r.status?' ('+r.status+')':'') + ': ' + (r.error||'unknown') + '.</span> Typing a model name still works.';
+    return;
+  }
+  modelList.innerHTML = r.models.map(function(m){
+    return '<option value="' + m.id + '">' + (m.name!==m.id ? m.name : '') + '</option>'; }).join('');
+  const cur=(modelInput.value||'').trim();
+  const known=r.models.some(function(m){ return m.id===cur; });
+  modelListNote.innerHTML = r.models.length + ' model(s) available to this key.'
+    + (cur && !known ? ' <span style="color:var(--warn)">Current value ' + cur + ' is not among them.</span>' : '');
+}
+async function saveModel(){
+  await j('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({anthropic_model:modelInput.value.trim(), anthropic_effort:effortInput.value})});
+  modelMsg.textContent='saved.'; loadSettings(); refreshStatus();
+}
+
+refreshStatus(); startLive(); loadRolls(); loadSettings(); setInterval(refreshStatus, 20000);
+</script>
+</body>
+</html>

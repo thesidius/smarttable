@@ -1,0 +1,28 @@
+{
+  "mode": "locked",
+  "model": "imx219",
+  "locked_controls": {
+    "AeEnable": false,
+    "AwbEnable": false,
+    "ExposureTime": 29999,
+    "AnalogueGain": 3.4133334159851074,
+    "ColourGains": [
+      1.9668434858322144,
+      1.5426876544952393
+    ]
+  },
+  "stats": {
+    "mean": 90.52,
+    "std": 44.79,
+    "p1": 46.0,
+    "p5": 54.0,
+    "median": 75.0,
+    "p95": 218.0,
+    "p99": 245.0,
+    "clipped_high_pct": 0.79,
+    "clipped_low_pct": 0.0,
+    "rms_contrast": 0.4948,
+    "laplacian_var": 26.9
+  },
+  "verdict": "WELL EXPOSED"
+}

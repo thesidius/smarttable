@@ -1,0 +1,30 @@
+# Secrets never live in this tree.
+#
+# The Anthropic API key and Claude Code OAuth token are stored in
+# ~/.dicecam/settings.json, deliberately OUTSIDE the project directory, so that
+# a stray `git add .` cannot publish them. These patterns are belt-and-braces
+# for anyone who moves that decision later.
+.dicecam/
+settings.local.json
+*.key
+*.pem
+.env
+.env.*
+
+# Session debris. Underscore-prefixed images are scratch captures written while
+# diagnosing something and are regenerated on demand -- 37 MB of them at the
+# time of writing. The non-underscore captures are kept because the docs cite
+# them as evidence for measurements.
+test-data/_*
+# ...except the one the docs cite as evidence for the white-balance finding.
+!test-data/_wb_demo.png
+
+# Camera/roll outputs are produced by running the thing, not by editing it.
+dataset/rolls.jsonl
+dataset/labels.jsonl
+dataset/crops/
+
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db

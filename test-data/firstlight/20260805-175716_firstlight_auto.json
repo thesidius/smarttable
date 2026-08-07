@@ -1,0 +1,27 @@
+{
+  "mode": "auto",
+  "model": "imx219",
+  "metadata_subset": {
+    "ExposureTime": 29999,
+    "AnalogueGain": 3.4133334159851074,
+    "ColourGains": [
+      1.9668434858322144,
+      1.5426876544952393
+    ],
+    "Lux": 367.44061279296875
+  },
+  "stats": {
+    "mean": 91.0,
+    "std": 44.88,
+    "p1": 47.0,
+    "p5": 54.0,
+    "median": 76.0,
+    "p95": 218.0,
+    "p99": 245.0,
+    "clipped_high_pct": 0.78,
+    "clipped_low_pct": 0.0,
+    "rms_contrast": 0.4931,
+    "laplacian_var": 28.6
+  },
+  "verdict": "WELL EXPOSED"
+}
