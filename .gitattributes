@@ -1,0 +1,18 @@
+# Shell scripts run on the Pi, which is Linux. If this repo is cloned on
+# Windows with core.autocrlf=true, git rewrites them with CRLF line endings and
+# the shebang line becomes "#!/bin/bash\r" -- the kernel then looks for an
+# interpreter literally named "bash\r" and reports "bad interpreter: No such
+# file or directory", which points at bash rather than at the line endings.
+#
+# run_camera_service.sh is the one that matters: it is the only supported way
+# to launch the camera service, because it exports LIBCAMERA_RPI_TUNING_FILE
+# before libcamera can resolve the tuning path.
+*.sh text eol=lf
+
+# Same reasoning for anything the Pi executes directly.
+*.py text eol=lf
+
+# Line-ending normalisation would corrupt these.
+*.png binary
+*.jpg binary
+*.pt binary

@@ -28,3 +28,7 @@ __pycache__/
 *.py[cod]
 .DS_Store
 Thumbs.db
+
+# ML toolchain: multi-GB venv, rebuilt from docs/instance-segmentation-plan.md
+.venv-ml/
+*.pt

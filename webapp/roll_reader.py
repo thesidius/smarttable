@@ -278,7 +278,7 @@ def _ask(ollama, model, prompt, b64, timeout):
     return r.get("response", "")
 
 
-def reconcile(readings, pi_count):
+def reconcile(readings):
     """Turn several readings into one result plus a per-value confidence.
 
     Positional matching is not possible -- the variants enumerate dice in
@@ -324,10 +324,6 @@ def reconcile(readings, pi_count):
 
     if len(set(counts)) > 1:
         issues.append(f"readings disagree on how many dice: {counts}")
-    if pi_count is not None and pi_count != expected:
-        issues.append(
-            f"camera counted {pi_count} dice, readings suggest {expected} -- a die "
-            f"may have been missed or invented")
 
     return {
         "dice": dice,
@@ -343,7 +339,291 @@ def reconcile(readings, pi_count):
     }
 
 
-def read_roll(image_bytes, pi_count=None, ollama="http://10.0.0.5:11434",
+SINGLE_DIE_PROMPTS = [
+    ("typed",
+     "This is ONE polyhedral RPG die, isolated on a plain grey background. Give its "
+     "type (d4/d6/d8/d10/d12/d20) and the number on the face pointing UP at the "
+     'camera. Reply ONLY as {"dice":[{"type":"dN","value":<int>}]}.'),
+    ("faces",
+     "A single RPG die photographed from directly above on a plain background. "
+     "Several numbers are visible, but only the one on the face aimed straight at "
+     "the camera counts - the others are on slanted sides. Count the die's faces to "
+     'name its type. Reply ONLY as {"dice":[{"type":"dN","value":<int>}]}.'),
+]
+
+
+BATCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "dice": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "type": {"type": "string",
+                             "enum": ["d4", "d6", "d8", "d10", "d12", "d20", "unknown"]},
+                    "value": {"type": "integer"},
+                },
+                "required": ["id", "type", "value"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["dice"],
+    "additionalProperties": False,
+}
+
+BATCH_PROMPTS = [
+    ("typed",
+     "Each image is ONE polyhedral RPG die, isolated on plain grey. They are "
+     "numbered from 0. For EVERY die give its id, its type "
+     "(d4/d6/d8/d10/d12/d20), and the number on the face pointing UP at the "
+     "camera. Several numbers are visible on each die; only the one on the face "
+     "aimed straight at the camera counts."),
+    ("faces",
+     "These images each show a single RPG die from directly above, numbered from "
+     "0. Work out each die's type by how many faces it has, and read the number "
+     "on its uppermost face - the one facing the camera, not the slanted sides. "
+     "Report every die by its id."),
+]
+
+
+def _claude_code_batch(prompt, images, model, token, timeout):
+    """One `claude -p` for ALL dice, not one per die.
+
+    Per-die calls cost a subprocess launch and a full agent startup each: 16
+    launches for 8 dice at two prompts, which was ~295 s of a ~298 s roll. The
+    agent can open several files in one session, so the whole roll becomes two
+    calls -- one per prompt variant -- and the startup is paid twice instead of
+    sixteen times.
+    """
+    work = tempfile.mkdtemp(prefix="dicecam_batch_")
+    try:
+        names = []
+        for i, img in enumerate(images):
+            n = f"die{i:02d}.png"
+            with open(os.path.join(work, n), "wb") as f:
+                f.write(img)
+            names.append(n)
+
+        full = (f"Read these {len(names)} image files in the current directory: "
+                + ", ".join(names) + ". The number in each filename is that die's id. "
+                + prompt)
+        env = dict(os.environ)
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+        env.pop("ANTHROPIC_API_KEY", None)
+        r = subprocess.run(
+            ["claude", "-p", full,
+             "--json-schema", json.dumps(BATCH_SCHEMA),
+             "--model", model, "--output-format", "json",
+             "--allowedTools", "Read",
+             "--disallowedTools",
+             "Bash Write Edit Glob Grep WebFetch WebSearch Task NotebookEdit",
+             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'],
+            env=env, cwd=work, capture_output=True, text=True, timeout=timeout)
+        out = (r.stdout or "").strip()
+        if not out:
+            raise RuntimeError((r.stderr or "claude produced no output").strip()[:300])
+        env_json = json.loads(out)
+        if env_json.get("is_error"):
+            raise RuntimeError(str(env_json.get("result"))[:300])
+        return env_json.get("result") or ""
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _anthropic_batch(prompt, images, model, key, timeout, effort=None):
+    """All dice in one Messages call, each image labelled by id in the text."""
+    content = []
+    for i, img in enumerate(images):
+        data, media = _shrink(img)
+        # Label BEFORE each image. Without it the model has to infer ordering
+        # from position alone, and any slip silently misattributes a value to
+        # the wrong die -- an error that looks like a misread rather than a swap.
+        content.append({"type": "text", "text": f"Die id {i}:"})
+        content.append({"type": "image",
+                        "source": {"type": "base64", "media_type": media,
+                                   "data": base64.b64encode(data).decode()}})
+    content.append({"type": "text", "text": prompt})
+
+    body = {
+        "model": model, "max_tokens": 4000,
+        "system": [{"type": "text",
+                    "text": "You read tabletop RPG dice from photographs. Be literal: "
+                            "report only what is visible, and never invent a die.",
+                    "cache_control": {"type": "ephemeral"}}],
+        "messages": [{"role": "user", "content": content}],
+        "output_config": {"format": {"type": "json_schema", "schema": BATCH_SCHEMA}},
+    }
+    if "haiku" not in str(model):
+        body["output_config"]["effort"] = effort or "low"
+
+    r = requests.post(ANTHROPIC_URL, timeout=timeout, json=body, headers={
+        "x-api-key": key, "anthropic-version": "2023-06-01",
+        "content-type": "application/json"})
+    if r.status_code != 200:
+        detail = ""
+        try:
+            detail = r.json().get("error", {}).get("message", "")
+        except ValueError:
+            pass
+        raise RuntimeError(f"Anthropic returned {r.status_code}" + (f": {detail}" if detail else ""))
+    b = r.json()
+    if b.get("stop_reason") == "refusal":
+        raise RuntimeError("the model declined this batch")
+    if b.get("stop_reason") == "max_tokens":
+        raise RuntimeError("reply truncated by max_tokens")
+    return "".join(blk.get("text", "") for blk in b.get("content", [])
+                   if blk.get("type") == "text")
+
+
+def _ollama_batch(prompt, images, ollama, model, timeout):
+    """Ollama takes an images[] array, so a batch is one request.
+
+    Its ability to keep several images distinct is weaker than the others' --
+    there is no way to interleave labels with the images the way the Messages
+    API allows, so ordering is positional and unverifiable. Kept because it is
+    local and free, and because the comparison is worth having; treat a batch
+    result from here with more suspicion than a per-die one.
+    """
+    r = requests.post(f"{ollama}/api/generate", timeout=timeout, json={
+        "model": model,
+        "prompt": (prompt + f"\n\nThere are {len(images)} images, in id order "
+                            f"starting at 0. Reply ONLY with "
+                            f'{{"dice":[{{"id":<int>,"type":"dN","value":<int>}}]}}.'),
+        "images": [base64.b64encode(i).decode() for i in images],
+        "stream": False, "options": {"temperature": 0},
+    }).json()
+    return r.get("response", "")
+
+
+def _parse_batch(text):
+    """{"dice":[{id,type,value}]} -> {id: {type, value}}."""
+    parsed = _parse(text)
+    if not parsed:
+        return {}
+    out = {}
+    for i, d in enumerate(parsed):
+        idx = d.get("id")
+        if idx is None:
+            idx = i                     # fall back to position if id was dropped
+        try:
+            out[int(idx)] = {"type": d.get("type"), "value": d.get("value")}
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def read_segmented_batch(dice_crops, provider, *, code_token=None, code_model=None,
+                         anthropic_key=None, anthropic_model=None,
+                         anthropic_effort=None, ollama=None, ollama_model=None,
+                         timeout=600, variants=2):
+    """Read every isolated die in ONE call per prompt variant.
+
+    Confidence is still cross-prompt agreement, never the model's own claim.
+    Batching does not weaken that: the variants remain independent calls, they
+    just each cover all the dice at once.
+    """
+    images = [base64.b64decode(d["crop"]) for d in dice_crops]
+    if not images:
+        return [], {}
+
+    prompts = BATCH_PROMPTS[:max(1, int(variants))]
+    per_variant, raw = [], {}
+    for name, prompt in prompts:
+        try:
+            if provider == "claude-code":
+                txt = _claude_code_batch(prompt, images, code_model or "claude-opus-5",
+                                         code_token, timeout)
+            elif provider == "anthropic":
+                txt = _anthropic_batch(prompt, images,
+                                       anthropic_model or "claude-opus-5",
+                                       anthropic_key, timeout, anthropic_effort)
+            else:
+                txt = _ollama_batch(prompt, images, ollama, ollama_model, timeout)
+            raw[name] = txt.strip()[:400]
+            per_variant.append(_parse_batch(txt))
+        except Exception as e:
+            raw[name] = f"ERROR: {e}"
+            per_variant.append({})
+
+    out = []
+    for i, d in enumerate(dice_crops):
+        reads = [v.get(i) for v in per_variant if v.get(i)]
+        types = [r["type"] for r in reads if r.get("type")]
+        vals = [r["value"] for r in reads if r.get("value") is not None]
+        agree = (len(reads) == len(prompts) and len(set(types)) == 1
+                 and len(set(vals)) == 1)
+        out.append({
+            "id": d.get("id", i),
+            "bbox": d.get("bbox"),
+            "type": types[0] if types else None,
+            "value": vals[0] if vals else None,
+            "confidence": "high" if agree else "low",
+            "note": None if agree else
+                    ("read differently across prompts: types %s values %s"
+                     % (types or "-", vals or "-")),
+        })
+    return out, raw
+
+
+def read_segmented(dice_crops, provider, *, code_token=None, code_model=None,
+                   anthropic_key=None, anthropic_model=None, anthropic_effort=None,
+                   ollama=None, ollama_model=None, timeout=300, variants=1):
+    """Read each isolated die crop. Phase 1 stage 2.
+
+    One die per image, neighbours masked out. The reader failed on piles because
+    of clutter, not because of the die -- measured, a d20 showing 20 read as "14"
+    in a pile and "20" once isolated -- so this is the configuration it is
+    actually good at.
+
+    Confidence still comes from cross-prompt disagreement, never from the model
+    saying it is confident; that was measured worthless. With one die per call,
+    two prompts are enough for the signal.
+    """
+    prompts = SINGLE_DIE_PROMPTS[:max(1, int(variants))]
+    out = []
+    for d in dice_crops:
+        img = base64.b64decode(d["crop"])
+        readings, raw = [], {}
+        for name, prompt in prompts:
+            try:
+                if provider == "claude-code":
+                    txt = _claude_code(prompt, img, code_model or "claude-opus-5",
+                                       code_token, timeout)
+                elif provider == "anthropic":
+                    txt = _anthropic(prompt, img, anthropic_model or "claude-opus-5",
+                                     anthropic_key, timeout, anthropic_effort)
+                else:
+                    txt = _ask(ollama, ollama_model, prompt,
+                               base64.b64encode(img).decode(), timeout)
+                raw[name] = txt.strip()[:200]
+                readings.append(_parse(txt))
+            except Exception as e:
+                raw[name] = f"ERROR: {e}"
+                readings.append(None)
+
+        got = [r[0] for r in readings if r]
+        types = [g.get("type") for g in got if g.get("type")]
+        vals = [g.get("value") for g in got if g.get("value") is not None]
+        agree = len(set(vals)) == 1 and len(vals) == len(prompts)
+        type_agree = len(set(types)) == 1 and len(types) == len(prompts)
+
+        out.append({
+            "id": d.get("id"),
+            "bbox": d.get("bbox"),
+            "type": types[0] if types else None,
+            "value": vals[0] if vals else None,
+            "confidence": "high" if (agree and type_agree) else "low",
+            "note": None if (agree and type_agree) else
+                    ("prompts disagree: types %s values %s" % (types or "-", vals or "-")),
+            "raw": raw,
+        })
+    return out
+
+
+def read_roll(image_bytes, ollama="http://10.0.0.5:11434",
               model="gemma3:27b", timeout=300, provider=None,
               anthropic_key=None, anthropic_model=None, anthropic_effort=None,
               code_token=None, code_model=None, variants=None):
@@ -398,11 +678,10 @@ def read_roll(image_bytes, pi_count=None, ollama="http://10.0.0.5:11434",
             raw[name] = f"ERROR: {e}"
             results.append(None)
 
-    result = reconcile(results, pi_count)
+    result = reconcile(results)
     result["provider"] = provider
     result["model"] = ({"claude-code": code_model or "claude-opus-5",
                         "anthropic": a_model}.get(provider, model))
     result["variant_names"] = [n for n, _ in prompts]
     result["raw"] = raw
-    result["pi_count"] = pi_count
     return result

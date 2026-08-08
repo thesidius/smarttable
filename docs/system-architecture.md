@@ -40,9 +40,14 @@ subscription it costs nothing per roll.
 The cost is latency: `claude -p` is an agent, not a completion call. Unbounded
 it took 113 s; with swadeledger's constraining flags, 79 s; on a full tray,
 ~105 s and 7 476 output tokens. So the ensemble defaults to **one prompt** for
-this provider rather than three — the Pi's independent count still cross-checks,
-so a missed die is still caught; what is lost is per-die disagreement, the
-cheaper of the two signals.
+this provider rather than three.
+
+That trade was originally acceptable because the Pi's independent count still
+caught a missed die. That count is gone — it reported up to 73 dice for 8 — so
+per-die disagreement across prompts is now the *only* confidence signal, and
+dropping to one prompt gives it up entirely. Batching makes the second prompt
+affordable again (~3x faster than per-die calls), which is the reason to keep
+paying for it.
 
 ### Flags, and the one deliberate difference
 

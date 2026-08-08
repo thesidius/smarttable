@@ -1,9 +1,9 @@
 # Control panel
 
-Two services. Start both.
+Three services. The camera one starts itself.
 
 ```bash
-ssh paul@10.0.0.23 '~/pi-tower/run_camera_service.sh'
+ssh paul@10.0.0.23 'systemctl status dicecam'
 ```
 
 ```bash
@@ -15,25 +15,174 @@ Then open **http://10.0.0.5:5000**.
 | | |
 |---|---|
 | `pi-tower/camera_service.py` | Flask on the Pi, port 8081. Owns the camera. |
-| `pi-tower/run_camera_service.sh` | **Use this to start it** — see below. |
+| `pi-tower/dicecam.service` | systemd unit — starts the camera at boot. |
+| `pi-tower/run_camera_service.sh` | The unit's ExecStart; also how to run it by hand. |
 | `webapp/app.py` | Flask on TheBeast, port 5000. UI, Ollama, labels. |
 | `dataset/labels.jsonl` | Append-only label log. |
 
-## Always launch the Pi service via the shell script
+## The camera starts at boot
 
-`camera_service.py` tries to set `LIBCAMERA_RPI_TUNING_FILE` itself and **that
-does not reliably work**. libcamera resolves the tuning path early enough that
-an `os.environ` assignment at the top of the script can lose the race — verified
-here: the service came up on `imx219.json` with that code in place, while a
-plain `export` before launch gets `imx219_noir.json` every time.
+`pi-tower/dicecam.service`, enabled. Install it with:
 
-The failure is silent. Wrong tuning does not error, it just costs ~0.14 Otsu
-separability on every frame the service captures.
+```bash
+sudo install -m 644 dicecam.service /etc/systemd/system/ && sudo systemctl enable --now dicecam
+```
 
-`/health` therefore reports the tuning **inherited from the launcher**, not
-`os.environ` after the script has written to it — reporting the latter would
-claim success in exactly the case that fails. The header pill shows
-`NoIR tuning` (green) or `WRONG tuning` (amber). Trust the pill.
+Two ordering facts it depends on, both learned the hard way from a real reboot:
+
+**The USB stick must be in `/etc/fstab`.** Left to udisks2 it mounts only when a
+desktop session logs in — far too late, and not guaranteed. `camera_service.py`
+picks its work directory once, at import, so a service that beats the mount
+falls back to the 7.4 GB SD card, which has already filled to 100% once and made
+captures vanish with "no such capture". The unit orders itself after
+`media-paul-pi_storage.mount`; `After=` without `Requires=`, so a pulled stick
+degrades to the SD card and says so in `work_source` rather than refusing to
+start.
+
+**The camera can lose a race for contiguous memory.** Full-sensor RGB888 plus
+the RAW stream want ~100 MB of CMA, and the desktop's KMS framebuffers take
+nearly all of it while booting: measured 3 MB free of 256 MB at 49 s into a
+boot, and 217 MB free ninety seconds later. The first boot crashed with
+`OSError: [Errno 12] Cannot allocate memory` and only recovered via
+`Restart=always`, 191 s after the reboot. `Camera._open()` now retries with
+backoff instead — 62 s, zero restarts. Reserving more CMA would permanently
+cost a 1 GB Pi general-purpose RAM to fix a problem that lasts a minute.
+
+## Exposure: auto, locked, or manual
+
+Four buttons on the Mount tab.
+
+| | |
+|---|---|
+| **auto (meter the dice)** | Find the brightest exposure that does not blow out the dice faces, and lock there. This is the one to use. |
+| **apply manual** | Set exposure, gain and white balance explicitly. |
+| **lock where AE lands** | Freeze whatever ordinary auto-exposure converged to. |
+| **release to AE** | Free-running AE/AWB. Drifts, so captures are not comparable. |
+
+### Highlight-priority metering: `POST /autoexpose`
+
+Ordinary AE meters the whole frame. The tray floor is most of that frame and it
+is dark, so AE raises brightness until the *floor* is mid-grey — and the dice,
+far brighter, saturate. A clipped numeral is unreadable at any resolution, so
+this is the one exposure error that directly costs reads.
+
+`/autoexpose` bisects exposure against the 99.5th percentile of the pixels
+*inside the tray boundary*, targeting 245, then locks. Measured on the same
+scene:
+
+| | clipped | p99.9 |
+|---|---|---|
+| plain AE | 0.233% | 254 |
+| highlight metering (117 ms @ gain 1.0) | **0.022%** | **233** |
+
+Ten times less clipping, and it landed within 7% of the value found by hand.
+
+Two implementation notes that matter:
+
+**Gain is fixed during the search, not inherited.** Inheriting made the result
+depend on history — the same tray metered to 55 ms because a gain of 4.0 was
+left over from an earlier lock, where from a clean state it chose 117 ms. Both
+are correct exposures; only one is reproducible. `analogue_gain` is a request
+parameter defaulting to 1.0. It is not a quality knob (see the equivalence
+below); it buys preview frame rate.
+
+**The metric is a plain percentile, not "pixels brighter than the floor."** The
+selective version looked more precise and failed: the first bisection step lands
+on a deliberately extreme exposure, the frame saturates, every pixel equals the
+floor, and "brighter than the floor" selects nothing — so the probe meant to
+report *far too bright* reported *no dice here* and the whole run aborted. The
+dice are far more than 0.5% of the tray, so the top 0.5% of it is dice at any
+exposure, and at saturation it correctly reads 255.
+
+`POST /exposure {"exposure_us": 110000, "analogue_gain": 1.0, "colour_gains": [0.82, 1.49]}`
+— any subset; the rest is left alone. `GET /exposure` returns the current values
+plus the sensor's ranges, so the UI bounds its sliders from the camera rather
+than from a guess.
+
+All three persist to `~/.config/dicecam/exposure.json` and are re-applied on
+restart, along with the frame duration — without which a restored long exposure
+would silently clamp back.
+
+### The response reports what the sensor DID, not what you asked
+
+A request for 227 ms came back as 47 ms with no error, because **exposure time
+is capped by frame duration**: the video mode was running ~21 fps, and a frame
+cannot expose for longer than it lasts. `camera_controls` cheerfully advertises
+an ExposureTime maximum of **11.77 seconds** — the sensor's limit, not the
+reachable one.
+
+`set_manual()` now raises `FrameDurationLimits` to fit the requested exposure,
+and reports the preview frame-rate cost rather than hiding it. It also reads the
+applied values back from sensor metadata and flags any remaining gap. The
+sliders snap to what was actually applied — leaving them on the request would
+show a number the camera never used.
+
+### Exposure time and analogue gain are interchangeable here
+
+The intuitive theory — dice are stationary, so motion blur is free, so trade
+gain for time and get a cleaner image — is **false at this light level**.
+Measured on the same scene:
+
+| | floor | noise | clipped |
+|---|---|---|---|
+| 47 ms @ gain 4.8 | 131.6 | 3.26 | 0.23% |
+| 227 ms @ gain 1.0 | 132.1 | 3.33 | 0.25% |
+
+Identical. The noise is photon-limited, and the same total light arrives either
+way. Matching floor means confirm the two exposures really were equivalent, so
+this is a measurement rather than a coincidence.
+
+### What is worth tuning is total brightness, and the limit is clipping
+
+At gain 1.0, sweeping exposure:
+
+| exposure | floor | clipped | p99 |
+|---|---|---|---|
+| 45 ms | 82.0 | 0.000% | 118 |
+| 70 ms | 110.8 | 0.000% | 156 |
+| **110 ms** | **145.7** | **0.000%** | **194** |
+| 160 ms | 175.9 | 0.059% | 221 |
+| 227 ms | 201.9 | 0.326% | 240 |
+
+**110 ms at gain 1.0 is the operating point**: the brightest setting that clips
+nothing. A clipped numeral is unreadable at any resolution, and auto-exposure
+walks straight into that — it meters the whole tray, most of which is dark
+floor, and pushes brightness until the floor is mid-grey.
+
+A caveat on how far to trust this: a synthetic numeral-vs-body contrast score
+kept improving all the way to 227 ms, i.e. it disagrees with the clipping
+argument at the top end. The only metric that settles it is whether the reader
+gets the values right, and that has not been measured across this sweep. 110 ms
+is the conservative choice, not a proven optimum.
+
+## The NoIR tuning: the environment variable does NOT work
+
+Setting `LIBCAMERA_RPI_TUNING_FILE` — from a launcher script, from `.bashrc`, or
+from Python — is **silently discarded**. picamera2 manages the tuning file
+itself and, constructed without a `tuning=` argument, does:
+
+```
+os.environ.pop("LIBCAMERA_RPI_TUNING_FILE", None)  # Use default tuning
+                                    -- picamera2.py:337, v0.7.1+rpt20260609
+```
+
+It pops the variable *before* libcamera reads it, so the export loses every
+time regardless of who wins the race. `camera_service.py` passes the path
+through `Picamera2(tuning=...)` instead, which is the supported API.
+
+This went unnoticed because the check was watching the wrong thing. `/health`
+reported the environment variable, which *we* had set, so it read
+`noir_tuning_active: true` while libcamera's own log said
+`Using tuning file .../imx219.json`. It is now read back from picamera2 after
+construction, where it reflects what libcamera was actually handed. To confirm
+independently, ask libcamera:
+
+```bash
+ssh paul@10.0.0.23 "journalctl -u dicecam -b | grep 'Using tuning file'"
+```
+
+The failure is silent either way: wrong tuning does not error, it costs ~0.14
+Otsu separability and 46 grey levels of numeral contrast on every frame.
 
 ### Killing the service
 
@@ -48,13 +197,13 @@ ssh paul@10.0.0.23 'fuser -k 8081/tcp'
 ## One camera configuration, never switched
 
 The Pi runs the camera continuously in a video configuration with two streams:
-`main` 1640×1232 RGB888 for capture/detect, `lores` 640×480 YUV420 for the MJPEG
+`main` 3280×2464 RGB888 for capture, `lores` 640×480 YUV420 for the MJPEG
 preview. The ISP produces both from the same frame, so preview costs almost
 nothing and never fights capture. Reconfiguring between video and still modes
 per request is slow on a Pi 3 and a reliable source of hangs.
 
-1640×1232 is not a compromise: the detection pipeline was tuned at that
-resolution and a die is ~114 px across.
+Full sensor because it buys accuracy *in the reader*, not in any CV silhouette:
+at 1640×1232 the model typed d20s unstably; at 3280×2464 it got 4/4 right.
 
 ## The preview is not proxied
 
@@ -71,30 +220,57 @@ pixels and get scaled to sensor pixels, stored with the frame size so the quad
 can be rescaled if applied at another resolution. Corners with no detail report
 "flat — nothing to resolve" instead of a meaningless focus number.
 
-**Detect** — capture, parameter sliders, overlay, crops. Re-detect runs on the
-*last capture* without re-capturing, so tuning does not disturb the scene.
+**Segment** (was Detect) — capture and segment with SAM2, **no reading**. Shows
+the tinted mask overlay and the isolated crops the reader will receive. ~6.5 s,
+against minutes for a read.
 
-**Label** — gemma3 pre-labelling then human confirmation. Suggestions are
-pre-labels, **not ground truth** — the model is verified on two crops. Labels
-append; `read_labels()` collapses to last-write-wins, so corrections are just
-another append. Append-only because labelling is the expensive, unrepeatable
-work and a partial rewrite could lose it.
+That split is the whole point of the tab. When a roll comes back wrong, "a mask
+merged two dice" and "the reader misread a clean crop" produce the identical
+symptom, and only one of them is worth paying a read to investigate. If each
+die has its own outline in the overlay, segmentation was fine.
 
-**Runtime** — reads a roll end to end. Pi captures, crops to the tray and
-counts; Ollama reads; the app reconciles. ~12–18 s. Settle detection is still
-explicitly "not implemented" (rolls are read on demand), and the pipeline
-reality-check table stays, because a panel that implies something works when it
-does not is worse than one that says nothing.
+The old sliders — variance window, min/max blob area, crop context, watershed
+toggle — are gone with the classical detector they tuned. Keeping them would
+have invited re-tuning a method already measured at 20-to-73 dice for 8.
+
+**Label** — pre-labelling then human confirmation, on the same SAM2 crops the
+reader sees. Provider is selectable (Claude Code / Anthropic / Ollama); it used
+to be hard-wired to Ollama, which meant pre-labelling used the weakest reader
+available while the rolls it produces training data *for* went through Claude
+Code. Suggestions are pre-labels, **not ground truth**.
+
+Saving writes the crop PNG under `dataset/crops/`, keyed by capture id and mask
+index, alongside the label. SAM2 crops are composited in memory and never exist
+on the Pi, so a label naming a Pi filename would point at nothing — and a label
+log whose crops cannot be reopened is useless as training data. Labels append;
+`read_labels()` collapses to last-write-wins, so corrections are just another
+append. Append-only because labelling is the expensive, unrepeatable work and a
+partial rewrite could lose it.
+
+**Runtime** — reads a roll end to end, via `/api/roll2`: Pi captures and crops,
+SAM2 separates the dice, the reader reads each isolated crop, the app
+reconciles. Settle detection is still explicitly "not implemented" (rolls are
+read on demand), and the pipeline reality-check table stays, because a panel
+that implies something works when it does not is worse than one that says
+nothing.
 
 ## The roll pipeline
 
 ```
-Pi /roll ──► capture ─► tray crop (lossless PNG) ─► independent die count
-                                    │
-TheBeast /api/roll ◄────────────────┘
-   └─► 3 DIFFERENT prompts to gemma3:27b ─► reconcile ─► values + confidence
-                                                     └─► dataset/rolls.jsonl
+Pi /roll ──► capture ─► tray crop (lossless PNG)          1.6 s
+                              │
+TheBeast /api/roll2 ◄─────────┘
+   ├─► SAM2 ─► one mask per die ─► crop on neutral grey    3.5 s
+   └─► N crops ─► 2 DIFFERENT prompts ─► reconcile ─► values + confidence
+                                                  └─► dataset/rolls.jsonl
 ```
+
+**The Pi no longer counts.** It used to return an independent
+distance-transform count as a cross-check. On an 8-dice tray that count
+reported 20, 27, 36 and 73 — so it fired a mismatch warning on every roll, and
+a warning that always fires is a warning nobody reads. It also cost 67 s of Pi
+3 CPU per capture, which was the entire reason a capture was not near-instant.
+Removing it took `/roll` to 1.6 s. SAM2's mask count stands alone.
 
 **Three different prompts, not three repeats.** At temperature 0 the same
 prompt returns byte-identical output every time, so repetition catches nothing —
@@ -102,9 +278,8 @@ it is consistently wrong when wrong. Diversity has to come from the framing.
 
 **Confidence never comes from the model.** Asked to self-report, it returned
 `"confidence": "high"` with `"Clear view of the '9'"` for a die whose up-face
-is not recoverable from the image. Confidence here is derived from two things
-it does not control: agreement across the prompt variants, and the camera's
-independent count.
+is not recoverable from the image. Confidence is derived from something it does
+not control: agreement across the prompt variants.
 
 **Consensus is conservative, never the union.** An early version reported 12
 dice from a 6-die pile because one variant over-enumerated — listing side faces
@@ -185,8 +360,8 @@ network or the API is down.
 ## Tray boundary: saved calibration ONLY, never auto-detected
 
 `camera_service.load_quad()` reads `~/.config/dicecam/tray.json` and returns
-`None` if it is absent. `/analyze`, `/roll` and `/framing` all error out rather
-than guess. The service never calls `find_tray_quad()`.
+`None` if it is absent. `/roll` and `/framing` both error out rather than
+guess. The service never calls `find_tray_quad()`.
 
 Auto-detection still exists in `tray_framing_check.py` as a standalone
 convenience, and it is deliberately not in the service path: it found the LEGO

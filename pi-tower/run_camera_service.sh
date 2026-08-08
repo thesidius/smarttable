@@ -1,23 +1,36 @@
 #!/usr/bin/env bash
-# Launch the camera service with the NoIR tuning file in the ENVIRONMENT.
+# Launch the camera service.
 #
-# Why not just set it inside Python? camera_service.py does try, as a fallback,
-# but it cannot be relied on: libcamera resolves the tuning path early -- early
-# enough that an os.environ assignment made at the top of the script can still
-# lose the race. Verified on this Pi: the in-script set left the running service
-# on imx219.json while a plain `export` gets imx219_noir.json every time.
+# This script used to export LIBCAMERA_RPI_TUNING_FILE, on the finding that an
+# export before launch beat libcamera's early path resolution where an
+# os.environ assignment inside Python did not. That finding is now obsolete and
+# the export has been REMOVED, because it was not merely unnecessary -- it was
+# actively misleading.
 #
-# This matters more than it looks. The wrong tuning does not fail, it just
-# quietly costs ~0.14 of Otsu separability and 46 grey levels of numeral-to-body
-# contrast on every frame the service ever captures.
+# picamera2 pops the variable in its own constructor when it is called without
+# a tuning= argument:
+#
+#     os.environ.pop("LIBCAMERA_RPI_TUNING_FILE", None)  # Use default tuning
+#     -- picamera2.py:337, v0.7.1+rpt20260609
+#
+# So the export was being discarded before libcamera ever read it, while
+# everything that checked "is the NoIR tuning set?" saw the variable we had set
+# and reported success. camera_service.py now passes the tuning file through
+# Picamera2(tuning=...) instead, which is the supported API, and reads it back
+# afterwards so /health reports the outcome rather than the intention.
+#
+# The service is normally run by systemd, not by hand:
+#
+#     sudo systemctl status dicecam
+#     journalctl -u dicecam -f
+#
+# This script remains the ExecStart target and the way to run it in a terminal.
 set -euo pipefail
 
-export LIBCAMERA_RPI_TUNING_FILE=/usr/share/libcamera/ipa/rpi/vc4/imx219_noir.json
-
-if [[ ! -f "$LIBCAMERA_RPI_TUNING_FILE" ]]; then
-    echo "FATAL: NoIR tuning file not found at $LIBCAMERA_RPI_TUNING_FILE" >&2
-    echo "Refusing to start on the wrong colour pipeline." >&2
-    exit 1
+TUNING=/usr/share/libcamera/ipa/rpi/vc4/imx219_noir.json
+if [[ ! -f "$TUNING" ]]; then
+    echo "WARNING: NoIR tuning file not found at $TUNING" >&2
+    echo "The service will start on the IR-cut tuning and say so in /health." >&2
 fi
 
 cd "$(dirname "$0")"

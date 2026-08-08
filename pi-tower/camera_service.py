@@ -3,8 +3,11 @@
 camera_service.py -- thin HTTP camera head, runs ON the Pi.
 
 The control panel lives on TheBeast (10.0.0.5); the camera does not. This
-service is the seam between them: it owns the camera, does the cheap
-high-volume work (capture, detect, crop) and hands back small results.
+service is the seam between them, and its job is deliberately small: own the
+camera, hand back a frame cropped to the tray. It used to also detect and count
+the dice; that was measured wrong by up to 9x and cost 67 s of Pi 3 CPU per
+capture, and SAM2 on the workstation replaced it. Nothing here is on the
+accuracy path any more.
 
 Design decision -- ONE camera configuration, never switched.
 
@@ -12,25 +15,26 @@ picamera2 can reconfigure between video and still modes, but doing that live,
 per request, on a Pi 3 is slow and a reliable source of hangs. Instead the
 camera runs continuously in a video configuration with two streams:
 
-    main  1640x1232 RGB888  -- what capture/detect operate on
+    main  3280x2464 RGB888  -- what /capture and /roll operate on
     lores  640x480  YUV420  -- what the MJPEG preview serves
 
 The ISP produces both from the same frame, so the preview costs almost nothing
-and never fights the capture path. 1640x1232 is not a compromise here: the whole
-detection pipeline was tuned at that resolution, and a die is ~114 px across,
-far more than any classifier needs.
+and never fights the capture path. See MAIN_SIZE below for why the main stream
+is the full sensor.
 
 Endpoints:
     GET  /health                  service + camera state
     GET  /stream                  multipart MJPEG preview
     GET  /snapshot.jpg            single full-res JPEG (calibration clicking)
     POST /capture                 freeze a frame, returns its id
-    POST /analyze                 detect dice on a captured frame
-    POST /roll                    capture + tray crop + independent die count
+    POST /roll                    capture + crop to the tray
     GET  /framing                 tray framing report
     GET  /calibration             read tray quad
     POST /calibration             write tray quad
     POST /lock  POST /unlock      freeze / release AE+AWB
+    GET  /exposure                current settings + the sensor's real ranges
+    POST /exposure                set exposure / gain / white balance by hand
+    POST /autoexpose              meter the DICE, not the tray, then lock
     GET  /file/<name>             serve a produced image
 """
 
@@ -41,36 +45,36 @@ import sys
 import threading
 import time
 
-# BEST-EFFORT ONLY -- launch via run_camera_service.sh instead.
-#
 # libcamera cannot tell a NoIR module from a standard V2 and defaults to the
-# IR-cut tuning, which costs real numeral separability. Setting the variable
-# here looks like it should work and does not reliably: libcamera resolves the
-# tuning path early enough that this assignment can lose the race, and it did on
-# this Pi -- the service came up on imx219.json with the code below in place,
-# while a plain `export` before launch gets imx219_noir.json every time.
+# IR-cut tuning, which costs real numeral separability -- ~0.14 Otsu and 46 grey
+# levels of numeral-to-body contrast on every frame, with no error to show for
+# it.
 #
-# Kept as a fallback for someone running the file directly. /health reports
-# which tuning actually won, and that report is the one to trust.
+# THE ENVIRONMENT VARIABLE NO LONGER WORKS. Setting LIBCAMERA_RPI_TUNING_FILE,
+# whether from a launcher script or from Python, is silently undone: picamera2
+# manages the tuning file itself and, when its constructor is called without a
+# tuning= argument, does
+#
+#     os.environ.pop("LIBCAMERA_RPI_TUNING_FILE", None)  # Use default tuning
+#
+# (picamera2.py:337, v0.7.1+rpt20260609). It pops the variable BEFORE libcamera
+# reads it, so the export loses every time no matter who wins the race. This was
+# caught only because a post-reboot journal showed libcamera announcing
+# "Using tuning file .../imx219.json" while /health cheerfully reported the NoIR
+# tuning active -- /health was reporting the variable, which was set, rather
+# than the outcome, which was wrong.
+#
+# Pass it through the supported API instead. picamera2 then sets the variable
+# itself, immediately before opening the camera, and leaves it set.
 NOIR_TUNING = "/usr/share/libcamera/ipa/rpi/vc4/imx219_noir.json"
-
-# Captured BEFORE we touch it. This -- not os.environ afterwards -- is the
-# honest signal for whether the NoIR tuning is really in force, because only a
-# value inherited from the launcher is guaranteed to have beaten libcamera to
-# it. Reporting os.environ after our own assignment would claim success in
-# exactly the case that silently fails.
-INHERITED_TUNING = os.environ.get("LIBCAMERA_RPI_TUNING_FILE")
-
-if "LIBCAMERA_RPI_TUNING_FILE" not in os.environ and os.path.exists(NOIR_TUNING):
-    os.environ["LIBCAMERA_RPI_TUNING_FILE"] = NOIR_TUNING
+TUNING = NOIR_TUNING if os.path.exists(NOIR_TUNING) else None
 
 import cv2                                    # noqa: E402
 import numpy as np                            # noqa: E402
 from flask import Flask, Response, jsonify, request, send_from_directory  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dice_detect import (detect_all, flag, fit_quad_to_frame, to_gray,   # noqa: E402
-                         reference_geometry, is_clump)
+from tray_geometry import fit_quad_to_frame                           # noqa: E402
 
 try:
     from picamera2 import Picamera2
@@ -89,28 +93,162 @@ except ImportError:
 # lores, which is unaffected.
 MAIN_SIZE = (3280, 2464)
 LORES_SIZE = (640, 480)
-WORK = os.path.expanduser("~/dicecam-web")
 CONFIG = os.path.expanduser("~/.config/dicecam/tray.json")
 EXPOSURE = os.path.expanduser("~/.config/dicecam/exposure.json")
 
-os.makedirs(WORK, exist_ok=True)
+# Captures go to external storage when it is there.
+#
+# The SD card is 7.4 GB with a Desktop OS using 5 GB of it, which left ~100 MB
+# of headroom -- and full-sensor frames are 1-2 MB each. It filled, and a full
+# card does not announce itself: cv2.imwrite returns False, /capture still
+# returned an id, and the failure surfaced later as "no such capture" on another
+# screen entirely.
+#
+# FALL BACK rather than assume. /media/paul/pi_storage is a udisks user mount,
+# so it may simply not be there after a reboot, and a service that dies because
+# a USB stick was pulled is worse than one that quietly uses the SD card and
+# says so. /health reports which is in use.
+USB_WORK = "/media/paul/pi_storage/dicecam"
+SD_WORK = os.path.expanduser("~/dicecam-web")
+
+
+def _pick_work():
+    override = os.environ.get("DICECAM_WORK")
+    if override:
+        return override, "env"
+    parent = os.path.dirname(USB_WORK)
+    if os.path.isdir(parent) and os.access(parent, os.W_OK):
+        return USB_WORK, "usb"
+    return SD_WORK, "sd-card"
+
+
+WORK, WORK_SOURCE = _pick_work()
+try:
+    os.makedirs(WORK, exist_ok=True)
+except OSError:
+    WORK, WORK_SOURCE = SD_WORK, "sd-card (usb unwritable)"
+    os.makedirs(WORK, exist_ok=True)
+
+# Full-sensor frames are ~1-2 MB each and a roll writes several. Left alone this
+# filled a 6.8 GB SD card to 100%, at which point cv2.imwrite silently wrote
+# nothing while /capture still returned an id -- so the failure surfaced minutes
+# later as "no such capture" on a completely unrelated screen.
+# Retention stays even on the 59 GB stick -- unbounded growth is a slow leak,
+# not a safe default -- but there is no reason to be stingy when the space is
+# there.
+KEEP_FILES = int(os.environ.get("DICECAM_KEEP", "600" if WORK_SOURCE == "usb" else "60"))
+MIN_FREE_MB = 200
+
 app = Flask(__name__)
+
+
+def _prune():
+    """Keep the newest KEEP_FILES artefacts. Cheap, and runs before each write."""
+    try:
+        entries = [(os.path.getmtime(os.path.join(WORK, f)), f)
+                   for f in os.listdir(WORK)]
+    except OSError:
+        return
+    for _, f in sorted(entries, reverse=True)[KEEP_FILES:]:
+        try:
+            os.remove(os.path.join(WORK, f))
+        except OSError:
+            pass
+
+
+def _free_mb():
+    st = os.statvfs(WORK)
+    return (st.f_bavail * st.f_frsize) / (1024 * 1024)
+
+
+def _cma_free_mb():
+    """Free contiguous memory. This, not free RAM, is what the camera runs out of."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("CmaFree:"):
+                    return int(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return float("nan")
+
+
+def _write_image(path, img, params=None):
+    """Write, and FAIL LOUDLY if it did not happen.
+
+    cv2.imwrite returns False on a full disk rather than raising. Trusting it
+    is how a full card became a confusing error on another screen an hour later.
+    """
+    ok = cv2.imwrite(path, img, params or [])
+    if not ok or not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise IOError(f"could not write {os.path.basename(path)} "
+                      f"({_free_mb():.0f} MB free on the Pi)")
+    return path
 
 
 class Camera:
     """Owns the Picamera2 instance and a background frame grabber."""
 
+    # Buffers for a full-sensor RGB888 main stream plus the RAW stream come out
+    # of CMA, and want ~100 MB. At boot the desktop's KMS framebuffers get there
+    # first: measured 49 s into a boot, free_cma was 3 MB of 256 MB, and the
+    # allocation failed with "Cannot allocate memory". Ninety seconds later the
+    # same machine had 217 MB free.
+    #
+    # So the contention is transient and waiting is the correct response, not
+    # reserving more CMA (which permanently costs a 1 GB Pi general-purpose RAM
+    # to fix a problem that lasts a minute) and not relying on systemd's
+    # Restart= (which recovers, but only after the process has already died with
+    # a traceback that looks like a hardware fault).
+    OPEN_ATTEMPTS = 10
+    OPEN_BACKOFF_S = 6
+
+    def _open(self):
+        """Open and configure the camera, waiting out transient CMA pressure.
+
+        Returns (picam2, tuning_actually_in_force).
+        """
+        last = None
+        for attempt in range(1, self.OPEN_ATTEMPTS + 1):
+            try:
+                # tuning= is the only mechanism that works; see NOIR_TUNING.
+                picam2 = Picamera2(tuning=TUNING)
+                picam2.configure(picam2.create_video_configuration(
+                    main={"size": MAIN_SIZE, "format": "RGB888"},
+                    lores={"size": LORES_SIZE, "format": "YUV420"},
+                ))
+                # Read it back AFTER construction, not before. picamera2 sets
+                # this itself when handed a tuning file and pops it when not, so
+                # post-construction it reports what libcamera was actually given
+                # -- which is the thing the old env-var check only appeared to
+                # be checking.
+                return picam2, os.environ.get("LIBCAMERA_RPI_TUNING_FILE")
+            except Exception as e:
+                last = e
+                if attempt == self.OPEN_ATTEMPTS:
+                    break
+                print(f"[camera] open attempt {attempt}/{self.OPEN_ATTEMPTS} failed "
+                      f"({e}); {_cma_free_mb():.0f} MB CMA free, retrying in "
+                      f"{self.OPEN_BACKOFF_S}s", flush=True)
+                try:
+                    picam2.close()
+                except Exception:
+                    pass
+                time.sleep(self.OPEN_BACKOFF_S)
+        raise RuntimeError(
+            f"could not open the camera after {self.OPEN_ATTEMPTS} attempts over "
+            f"~{self.OPEN_ATTEMPTS * self.OPEN_BACKOFF_S}s: {last}. "
+            f"{_cma_free_mb():.0f} MB CMA free -- if this is 0 the framebuffers "
+            f"took it, if it is large the camera itself is the problem.")
+
     def __init__(self):
-        self.picam2 = Picamera2()
-        self.picam2.configure(self.picam2.create_video_configuration(
-            main={"size": MAIN_SIZE, "format": "RGB888"},
-            lores={"size": LORES_SIZE, "format": "YUV420"},
-        ))
+        self.picam2, self.tuning_active = self._open()
         self.lock = threading.Lock()
         self.latest_main = None
         self.latest_lores = None
         self.meta = {}
         self.locked = False
+        self.mode = None                   # None | "auto-lock" | "manual"
         self.locked_controls = {}
         self.lock_lux = None
         self.running = True
@@ -141,9 +279,10 @@ class Camera:
             time.sleep(1.0)                 # let the pipeline accept controls
             self.picam2.set_controls(ctrl)
             self.locked = True
+            self.mode = saved.get("mode", "auto-lock")
             self.locked_controls = saved["controls"]
             self.lock_lux = saved.get("lux")
-            print(f"[camera] restored exposure lock from {EXPOSURE}: "
+            print(f"[camera] restored {self.mode} exposure from {EXPOSURE}: "
                   f"{ctrl.get('ExposureTime')}us gain {ctrl.get('AnalogueGain')}",
                   flush=True)
         except Exception as e:
@@ -201,6 +340,7 @@ class Camera:
             "colour_gains": [round(float(cg[0]), 3), round(float(cg[1]), 3)] if cg else None,
             "lux": round(float(m["Lux"]), 1) if m.get("Lux") is not None else None,
             "locked": self.locked,
+            "mode": self.mode,
             "lock_lux": round(float(self.lock_lux), 1) if self.lock_lux else None,
             "lock_stale": self._lock_stale(m.get("Lux")),
         }
@@ -210,16 +350,314 @@ class Camera:
         if not self.locked or not self.lock_lux or not lux_now:
             return None
         ratio = float(lux_now) / float(self.lock_lux)
-        if ratio > 1.5 or ratio < 0.67:
-            return (f"Lighting changed since the lock ({self.lock_lux:.0f} -> "
-                    f"{float(lux_now):.0f} lux). The frozen exposure and white "
-                    f"balance are for the OLD light -- expect a colour cast and "
-                    f"wrong brightness. Unlock, let it re-converge, and re-lock.")
-        return None
+        if ratio <= 1.5 and ratio >= 0.67:
+            return None
+        head = (f"Lighting changed since the settings were fixed "
+                f"({self.lock_lux:.0f} -> {float(lux_now):.0f} lux).")
+        if self.mode == "manual":
+            # Manual values were chosen on purpose. Report the change, but do
+            # not tell the operator to throw away a deliberate setting -- they
+            # may well have dialled it in for exactly this reason.
+            return (f"{head} These are MANUAL settings, so nothing has been "
+                    f"changed for you. If the picture now looks wrong, adjust "
+                    f"them; if it looks right, ignore this.")
+        return (f"{head} The frozen exposure and white balance are for the OLD "
+                f"light -- expect a colour cast and wrong brightness. Unlock, "
+                f"let it re-converge, and re-lock -- or set values manually.")
+
+    # A frame cannot expose for longer than it lasts, so ExposureTime is capped
+    # by FrameDurationLimits regardless of what the sensor could do. Measured
+    # here: camera_controls reports an ExposureTime maximum of 11.77 SECONDS,
+    # but asking for 227 ms produced 47 ms, because the video configuration was
+    # running ~21 fps. Nothing errors -- the picture just comes out dark.
+    #
+    # Long exposures are still worth ALLOWING, but not for the reason it is
+    # tempting to assume. The obvious theory -- stationary dice mean motion blur
+    # is free, so trade gain for time and get a cleaner image -- was measured
+    # here and is FALSE at this light level:
+    #
+    #     47 ms @ gain 4.8   floor 131.6   noise 3.26   clipped 0.23%
+    #    227 ms @ gain 1.0   floor 132.1   noise 3.33   clipped 0.25%
+    #
+    # Identical. The noise is photon-limited, not read- or gain-limited, and the
+    # same total light arrives either way. So exposure time and analogue gain are
+    # interchangeable, and the thing actually worth tuning is TOTAL brightness --
+    # specifically, keeping the numerals below clipping. At gain 1.0: 110 ms
+    # clipped nothing, 160 ms clipped 0.06%, 227 ms clipped 0.33%.
+    #
+    # The frame duration is raised to fit the requested exposure rather than
+    # silently truncating it, because the truncation was invisible: a request
+    # for 227 ms came back as 47 ms and simply looked dark. The cost is preview
+    # frame rate, which is reported rather than hidden.
+    MAX_FRAME_US = 2_000_000        # 0.5 fps floor; past here the UI feels broken
+
+    def limits(self):
+        """Control ranges, as the UI should present them.
+
+        exposure_us reports the ACHIEVABLE maximum -- what this service will
+        actually let you reach by raising the frame duration -- not the sensor's
+        theoretical one. Reporting 11.77 s when a request for 0.23 s comes back
+        clamped is worse than reporting nothing.
+        """
+        out = {}
+        for name in ("ExposureTime", "AnalogueGain", "ColourGains"):
+            c = self.picam2.camera_controls.get(name)
+            if not c:
+                continue
+            lo, hi, default = c
+            out[name] = {"min": lo, "max": hi, "default": default}
+        if "ExposureTime" in out:
+            sensor_max = out["ExposureTime"]["max"]
+            out["ExposureTime"]["max"] = min(sensor_max, self.MAX_FRAME_US)
+            out["ExposureTime"]["sensor_max"] = sensor_max
+            out["ExposureTime"]["note"] = (
+                "Exposures above the current frame duration raise it, which "
+                "slows the preview to at most 1e6/exposure_us fps. The sensor "
+                "itself would go to %.1f s." % (sensor_max / 1e6))
+        return out
+
+    def set_manual(self, exposure_us=None, analogue_gain=None, colour_gains=None):
+        """Set exposure/gain/white-balance explicitly. Any subset; rest unchanged.
+
+        Returns (applied, notes). APPLIED IS READ BACK FROM THE SENSOR, not
+        echoed from the request: the sensor quantises ExposureTime to whole line
+        times and clamps it to the frame duration, so asking for 60000us on a
+        mode whose maximum is 47638us gets you 47638 with no error. Reporting
+        the request back would make that invisible, and the operator would be
+        left tuning a number the camera never used.
+        """
+        with self.lock:
+            m = dict(self.meta)
+        lim = self.limits()
+        notes = []
+
+        def clamp(name, value):
+            c = lim.get(name)
+            if not c:
+                return value
+            if value < c["min"] or value > c["max"]:
+                notes.append(f"{name} {value:g} is outside the sensor's range "
+                             f"{c['min']:g}..{c['max']:g} and was clamped")
+                return max(c["min"], min(c["max"], value))
+            return value
+
+        ctrl = {"AeEnable": False, "AwbEnable": False}
+        ctrl["ExposureTime"] = int(clamp(
+            "ExposureTime",
+            int(exposure_us) if exposure_us is not None else int(m.get("ExposureTime", 0))))
+        ctrl["AnalogueGain"] = float(clamp(
+            "AnalogueGain",
+            float(analogue_gain) if analogue_gain is not None
+            else float(m.get("AnalogueGain", 1.0))))
+        cg = colour_gains if colour_gains is not None else m.get("ColourGains")
+        if cg:
+            ctrl["ColourGains"] = (float(clamp("ColourGains", float(cg[0]))),
+                                   float(clamp("ColourGains", float(cg[1]))))
+
+        # Make room in the frame for the exposure BEFORE asking for it. Without
+        # this the exposure is truncated to the frame duration with no error --
+        # a request for 227ms came back as 47ms and simply looked dark.
+        want_us = ctrl["ExposureTime"]
+        frame_us = max(want_us + 1000, 33333)
+        ctrl["FrameDurationLimits"] = (frame_us, frame_us)
+        if want_us > 100000:
+            notes.append(f"{want_us/1000:.0f} ms exposure caps the preview at "
+                         f"~{1e6/frame_us:.1f} fps. Fine for still dice; the "
+                         f"live view will look choppy while you adjust.")
+
+        self.picam2.set_controls(ctrl)
+
+        # Wait for a frame taken UNDER the new settings before reading back.
+        # set_controls is asynchronous and several frames are already in flight;
+        # reading immediately returns the old values and looks like the request
+        # was ignored.
+        applied = self._await_controls(ctrl)
+
+        # Report any remaining gap between request and reality. The clamp above
+        # only catches values outside the ranges WE know about; libcamera has
+        # its own, and the whole point of reading back is to notice when they
+        # disagree with us rather than to trust our own arithmetic.
+        got = applied.get("exposure_us")
+        if got and abs(got - want_us) > max(100, want_us * 0.05):
+            notes.append(f"asked for {want_us} us, sensor applied {got} us")
+
+        self.locked = True
+        self.mode = "manual"
+        self.locked_controls = {k: (list(v) if isinstance(v, tuple) else v)
+                                for k, v in ctrl.items()}
+        self.lock_lux = applied.get("lux")
+        self._persist()
+        return applied, notes
+
+    def _await_controls(self, want, timeout=3.0):
+        """Poll metadata until the requested exposure/gain shows up, or give up."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.lock:
+                m = dict(self.meta)
+            if (m.get("ExposureTime") is not None
+                    and abs(int(m["ExposureTime"]) - want["ExposureTime"]) <= max(
+                        50, want["ExposureTime"] * 0.02)
+                    and abs(float(m.get("AnalogueGain", 0)) - want["AnalogueGain"]) < 0.05):
+                break
+            time.sleep(0.1)
+        with self.lock:
+            m = dict(self.meta)
+        cg = m.get("ColourGains")
+        return {
+            "exposure_us": m.get("ExposureTime"),
+            "analogue_gain": round(float(m.get("AnalogueGain", 0)), 3),
+            "colour_gains": [round(float(cg[0]), 3), round(float(cg[1]), 3)] if cg else None,
+            "lux": round(float(m["Lux"]), 1) if m.get("Lux") is not None else None,
+        }
+
+    # --- highlight-priority auto exposure -----------------------------------
+    #
+    # Ordinary AE meters the whole tray. Most of the tray is dark floor, so it
+    # raises brightness until the FLOOR is mid-grey -- and the dice, which are
+    # far brighter than the floor, blow out. Measured: auto-exposure settled at
+    # a setting that clipped 0.23% of pixels, all of them on dice faces, and a
+    # clipped numeral is unreadable at any resolution.
+    #
+    # So meter the dice instead: find the brightest exposure at which the dice
+    # faces still stay below saturation, and freeze there.
+    HL_TARGET = 245        # where the top of the dice histogram should sit (0-255)
+    HL_PERCENTILE = 99.5   # ... measured here, not at the maximum
+    HL_STEPS = 8
+    # Gain is FIXED during the search, not inherited from whatever was set
+    # before. Inheriting made the result depend on history: the same tray
+    # metered to 55 ms because a gain of 4.0 happened to be left over, where
+    # from a clean state it would have chosen ~220 ms. Both are correct
+    # exposures; only one is reproducible.
+    #
+    # 1.0 is the default because it is the one value that is always available
+    # and always means the same thing. It is NOT chosen for image quality --
+    # measured on this rig, gain and exposure time are interchangeable, with
+    # identical noise and clipping. Raising it buys preview frame rate and
+    # nothing else, which is why it is a parameter rather than a constant.
+    HL_GAIN = 1.0
+
+    def _meter(self, box):
+        """(top, floor, clipped_pct) for the metered region, or None.
+
+        `top` is a high percentile of the WHOLE region, not of pixels selected
+        as "brighter than the floor". The selecting version looked more precise
+        and was wrong: the search's first step lands on a deliberately extreme
+        exposure, the frame saturates, every pixel equals the floor, and
+        "brighter than the floor" selects nothing -- so the probe that was
+        supposed to report "far too bright" reported "no dice here" instead.
+
+        A plain percentile has no such failure mode. The dice are far more than
+        0.5% of the tray area, so the top 0.5% of it is dice regardless of
+        exposure, and at saturation it correctly reads 255.
+
+        The lores Y plane is the same ISP output as a capture, through the same
+        tone curve, at 640x480 -- ample for a percentile, and far cheaper than a
+        full-sensor frame when this runs eight times in a row.
+        """
+        with self.lock:
+            lores = None if self.latest_lores is None else self.latest_lores.copy()
+        if lores is None:
+            return None
+        w, h = LORES_SIZE
+        y = lores[:h, :w].astype(np.float32)      # I420: Y plane first
+        if box:
+            x0, y0, x1, y1 = box
+            y = y[y0:y1, x0:x1]
+        if y.size < 100:
+            return None
+        return (float(np.percentile(y, self.HL_PERCENTILE)),
+                float(np.median(y)),
+                100.0 * float(np.mean(y >= 254)))
+
+    def autoexpose(self, box=None, gain=None):
+        """Brightest exposure that keeps the dice faces unsaturated, then lock.
+
+        Bisection rather than arithmetic: output brightness is NOT linear in
+        exposure time, because the ISP applies a tone curve. Bisection only
+        needs the relationship to be monotonic, which it is.
+        """
+        lo, hi = 200, int(min(self.MAX_FRAME_US,
+                              self.picam2.camera_controls["ExposureTime"][1]))
+        ceiling = hi
+        gain = float(self.HL_GAIN if gain is None else gain)
+
+        # Let white balance converge while the exposure search runs, then freeze
+        # it with the result -- otherwise a good exposure gets locked alongside
+        # whatever colour happened to be set beforehand.
+        self.picam2.set_controls({"AeEnable": False, "AwbEnable": True})
+
+        def probe(us):
+            frame_us = max(us + 1000, 33333)
+            self.picam2.set_controls({"ExposureTime": us, "AnalogueGain": gain,
+                                      "FrameDurationLimits": (frame_us, frame_us)})
+            self._await_controls({"ExposureTime": us, "AnalogueGain": gain})
+            time.sleep(0.35)                       # let the tone curve settle
+            return self._meter(box)
+
+        # Is there anything in the tray to meter? Ask once, at the exposure
+        # already in force -- which is known-reasonable -- rather than at a
+        # search extreme where the answer would be meaningless either way.
+        with self.lock:
+            here = int(self.meta.get("ExposureTime") or 110000)
+        m0 = probe(here)
+        if m0 is None:
+            return None, ["no frame available"]
+        if m0[0] - m0[1] < 20:
+            return None, ["Nothing bright in the tray to meter -- the tray "
+                          "looks empty. Highlight metering needs the dice in "
+                          "place. Roll them in and run it again."]
+
+        trace, best = [], None
+        for _ in range(self.HL_STEPS):
+            mid = (lo + hi) // 2
+            m = probe(mid)
+            if m is None:
+                return None, ["no frame available"]
+            top, floor, clipped = m
+            trace.append({"exposure_us": mid, "dice_top": round(top, 1),
+                          "floor": round(floor, 1),
+                          "clipped_pct": round(clipped, 3)})
+            if top <= self.HL_TARGET:
+                best = mid                          # headroom left; try brighter
+                lo = mid + 1
+            else:
+                hi = mid - 1
+            if lo > hi:
+                break
+
+        notes = []
+        if best is None:
+            # Even the dimmest exposure saturates: the scene itself is too
+            # bright for this gain. Say so rather than locking something wrong.
+            best = 200
+            notes.append("Even the shortest exposure blows out the dice. Lower "
+                         "the analogue gain or the lighting, then re-run.")
+        else:
+            at_best = [t for t in trace if t["exposure_us"] == best]
+            if best >= ceiling - 1 and at_best and at_best[0]["dice_top"] < self.HL_TARGET - 25:
+                notes.append("Hit the longest usable exposure and the dice are "
+                             "still dim. Add light or raise the analogue gain.")
+
+        applied, more = self.set_manual(exposure_us=best, analogue_gain=gain)
+        self.mode = "auto-highlight"
+        self._persist()
+        return {"applied": applied, "trace": trace}, notes + more
+
+    def _persist(self):
+        try:
+            os.makedirs(os.path.dirname(EXPOSURE), exist_ok=True)
+            json.dump({"controls": self.locked_controls, "lux": self.lock_lux,
+                       "mode": self.mode,
+                       "saved": time.strftime("%Y-%m-%dT%H:%M:%S")},
+                      open(EXPOSURE, "w"), indent=2)
+        except OSError as e:
+            print(f"[camera] could not persist exposure settings: {e}", flush=True)
 
     def unlock_exposure(self):
         self.picam2.set_controls({"AeEnable": True, "AwbEnable": True})
         self.locked = False
+        self.mode = None
         self.locked_controls = {}
         self.lock_lux = None
         # Remove the saved lock too, or the next restart silently re-locks to
@@ -244,6 +682,7 @@ class Camera:
             ctrl["ColourGains"] = (float(cg[0]), float(cg[1]))
         self.picam2.set_controls(ctrl)
         self.locked = True
+        self.mode = "auto-lock"
         self.locked_controls = {k: (list(v) if isinstance(v, tuple) else v)
                                 for k, v in ctrl.items()}
         # Remember how bright the room was when we froze. A lock is only valid
@@ -252,13 +691,7 @@ class Camera:
         # scene that no longer needs it, and the result is a heavy false colour
         # cast that looks like a camera fault rather than a stale setting.
         self.lock_lux = m.get("Lux")
-        try:
-            os.makedirs(os.path.dirname(EXPOSURE), exist_ok=True)
-            json.dump({"controls": self.locked_controls, "lux": self.lock_lux,
-                       "saved": time.strftime("%Y-%m-%dT%H:%M:%S")},
-                      open(EXPOSURE, "w"), indent=2)
-        except OSError as e:
-            print(f"[camera] could not persist exposure lock: {e}", flush=True)
+        self._persist()
         return self.locked_controls
 
 
@@ -306,14 +739,26 @@ def health():
         "ok": f is not None,
         "main_size": list(MAIN_SIZE),
         "lores_size": list(LORES_SIZE),
-        "tuning_file": INHERITED_TUNING or "(libcamera default -- imx219.json)",
-        "noir_tuning_active": INHERITED_TUNING == NOIR_TUNING,
-        "tuning_warning": (None if INHERITED_TUNING == NOIR_TUNING else
+        # cam.tuning_active is read back from picamera2 AFTER it opened the
+        # camera, so it is the file libcamera was actually handed. The previous
+        # version reported the environment variable we had set ourselves, which
+        # reported success in precisely the case that silently failed -- it read
+        # "NoIR active" for weeks while libcamera logged imx219.json.
+        "tuning_file": cam.tuning_active or "(libcamera default -- imx219.json)",
+        "noir_tuning_active": cam.tuning_active == NOIR_TUNING,
+        "tuning_warning": (None if cam.tuning_active == NOIR_TUNING else
                            "Running on the IR-cut tuning. Captures are usable but "
-                           "lose ~0.14 Otsu separability. Restart via "
-                           "run_camera_service.sh."),
+                           "lose ~0.14 Otsu separability and 46 grey levels of "
+                           "numeral contrast. Check that "
+                           f"{NOIR_TUNING} exists."),
+        "cma_free_mb": round(_cma_free_mb()),
         "controls": cam.controls(),
         "calibrated": os.path.exists(CONFIG),
+        "work_dir": WORK,
+        "work_source": WORK_SOURCE,
+        "free_mb": round(_free_mb()),
+        "disk_warning": (None if _free_mb() >= MIN_FREE_MB else
+                         f"only {_free_mb():.0f} MB free -- captures will fail"),
     })
 
 
@@ -344,9 +789,17 @@ def capture():
     f = cam.frame()
     if f is None:
         return jsonify({"error": "no frame yet"}), 503
+    _prune()
+    if _free_mb() < MIN_FREE_MB:
+        return jsonify({"error": f"only {_free_mb():.0f} MB free on the Pi -- "
+                                 f"refusing to capture rather than write a truncated "
+                                 f"frame that fails later"}), 507
     cid = time.strftime("%Y%m%d-%H%M%S")
     path = os.path.join(WORK, f"{cid}.jpg")
-    cv2.imwrite(path, f, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    try:
+        _write_image(path, f, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    except IOError as e:
+        return jsonify({"error": str(e)}), 507
     json.dump(cam.controls(), open(os.path.join(WORK, f"{cid}_controls.json"), "w"))
     return jsonify({"id": cid, "file": f"{cid}.jpg",
                     "width": f.shape[1], "height": f.shape[0],
@@ -366,118 +819,107 @@ def do_unlock():
     return jsonify({"locked": False})
 
 
-# ---------------------------------------------------------------- analysis ---
+@app.post("/autoexpose")
+def do_autoexpose():
+    """Expose for the DICE, not for the tray, then lock.
 
-def _resolve_frame(body):
-    """Load the requested capture, or grab a live frame if none specified."""
-    cid = body.get("id")
-    if cid:
-        p = os.path.join(WORK, f"{cid}.jpg")
-        if not os.path.exists(p):
-            return None, None, f"no such capture: {cid}"
-        return cv2.imread(p), cid, None
-    f = cam.frame()
-    return (f, None, None) if f is not None else (None, None, "no frame yet")
+    Ordinary auto-exposure meters the whole frame. The tray floor is most of
+    that frame and it is dark, so AE drives brightness up until the floor is
+    mid-grey -- and the dice, far brighter, saturate. Measured: AE settled on a
+    setting that clipped 0.23% of pixels, essentially all of them on dice faces.
 
-
-@app.post("/analyze")
-def analyze():
-    body = request.get_json(force=True) or {}
-    img, cid, err = _resolve_frame(body)
-    if err:
-        return jsonify({"error": err}), 503
-
+    This searches for the brightest exposure at which the top of the DICE
+    histogram still sits below saturation, and locks there.
+    """
+    box = None
     quad, qframe = load_quad()
-    if quad is None:
-        return jsonify({"error": "not calibrated -- set the tray quad first"}), 400
+    if quad is not None:
+        # Metering region in lores coordinates. Without this the search would
+        # meter the desk around the tray, which is exactly the mistake being
+        # fixed -- and the desk here is a bright purple mat.
+        try:
+            w, h = LORES_SIZE
+            sx = w / float(qframe[0] if qframe else MAIN_SIZE[0])
+            sy = h / float(qframe[1] if qframe else MAIN_SIZE[1])
+            xs, ys = quad[:, 0] * sx, quad[:, 1] * sy
+            box = (max(0, int(xs.min())), max(0, int(ys.min())),
+                   min(w, int(xs.max())), min(h, int(ys.max())))
+        except Exception:
+            box = None
+
+    body = request.get_json(silent=True) or {}
     try:
-        quad, _ = fit_quad_to_frame(quad, qframe or list(MAIN_SIZE), img.shape)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    gray, channel_note = to_gray(img, quad, body.get("channel", "auto"))
+        result, notes = cam.autoexpose(box=box, gain=body.get("analogue_gain"))
+    except Exception as e:
+        return jsonify({"error": f"auto-exposure failed: {e}"}), 500
+    if result is None:
+        return jsonify({"error": notes[0] if notes else "auto-exposure failed"}), 400
+    return jsonify({**result, "notes": notes, "metered_box": box,
+                    "controls": cam.controls()})
 
-    dets, rejected, info = detect_all(
-        gray, quad,
-        min_frac=float(body.get("min_frac", 0.002)),
-        max_frac=float(body.get("max_frac", 0.45)),
-        window=(int(body["window"]) if body.get("window") else None),
-        split=bool(body.get("split", True)),
-    )
-    ref = reference_geometry(dets)
-    for d in dets:
-        d["suspect_reasons"] = flag(d, ref)
-        d["suspect"] = bool(d["suspect_reasons"])
 
-    ctx = float(body.get("context", 1.5))
-    stamp = cid or time.strftime("%Y%m%d-%H%M%S")
-    overlay = img.copy()
-    cv2.polylines(overlay, [quad.astype(np.int32)], True, (0, 180, 0), 2)
-    crops = []
-    for d in dets:
-        x, y, w, h = d["bbox"]
-        col = (0, 0, 255) if d["suspect"] else (0, 255, 0)
-        cv2.rectangle(overlay, (x, y), (x + w, y + h), col, 3)
-        cv2.putText(overlay, f"#{d['id']}", (x, max(14, y - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, 2, cv2.LINE_AA)
+@app.get("/exposure")
+def get_exposure():
+    """Current settings plus the sensor's real ranges, for a UI to bound itself."""
+    return jsonify({"controls": cam.controls(), "limits": cam.limits()})
 
-        # Context multiplier is a request parameter, not a constant, because the
-        # bbox is not always the die. Under weak or coloured lighting the die
-        # body sinks to the same level as the tray floor and only the painted
-        # numerals carry local variance, so the detection bounds the DIGITS and
-        # a 1.5x crop shows a numeral with no die around it. A vision model then
-        # cannot tell which face is up -- measured: whole-die crops read
-        # correctly, numeral-only crops did not. Widening the context recovers
-        # the die. It treats the symptom; lighting is the cure.
-        side = int(max(w, h) * ctx)
-        cx, cy = x + w // 2, y + h // 2
-        x0, y0 = cx - side // 2, cy - side // 2
-        pl, pt = max(0, -x0), max(0, -y0)
-        pr = max(0, x0 + side - img.shape[1])
-        pb = max(0, y0 + side - img.shape[0])
-        sub = img[max(0, y0):min(img.shape[0], y0 + side),
-                  max(0, x0):min(img.shape[1], x0 + side)]
-        if sub.size == 0:
-            continue
-        if pl or pt or pr or pb:
-            sub = cv2.copyMakeBorder(sub, pt, pb, pl, pr, cv2.BORDER_REPLICATE)
-        name = f"{stamp}_d{d['id']:02d}.png"
-        cv2.imwrite(os.path.join(WORK, name),
-                    cv2.resize(sub, (128, 128), interpolation=cv2.INTER_AREA))
-        crops.append({"id": d["id"], "file": name, "suspect": d["suspect"],
-                      "reasons": d["suspect_reasons"]})
 
-    oname = f"{stamp}_overlay.jpg"
-    cv2.imwrite(os.path.join(WORK, oname), overlay, [cv2.IMWRITE_JPEG_QUALITY, 88])
+@app.post("/exposure")
+def set_exposure():
+    """Set exposure / gain / white balance by hand. Any subset.
 
-    return jsonify({
-        "id": stamp, "overlay": oname, "detections": dets, "crops": crops,
-        "rejected": rejected, "split": info.get("split"),
-        "channel": channel_note,
-        "clean": sum(1 for d in dets if not d["suspect"]),
-        "suspect": sum(1 for d in dets if d["suspect"]),
-        "controls": cam.controls(),
-    })
+        {"exposure_us": 30000, "analogue_gain": 4.0, "colour_gains": [1.5, 1.8]}
 
+    Auto-exposure converges to a picture that looks reasonable, which is not the
+    same as one that reads well: it meters the whole tray, most of which is dark
+    floor, and pushes gain up until that is mid-grey -- blowing out the numerals,
+    which are the only part that matters. Being able to set a shorter exposure
+    and a lower gain by hand is how you trade a dark tray for numerals that are
+    not clipped.
+
+    Returns what the sensor ACTUALLY applied, not what was asked for.
+    """
+    b = request.get_json(silent=True) or {}
+    cg = b.get("colour_gains")
+    if cg is not None and (not isinstance(cg, (list, tuple)) or len(cg) != 2):
+        return jsonify({"error": "colour_gains must be [red, blue]"}), 400
+    try:
+        applied, notes = cam.set_manual(
+            exposure_us=b.get("exposure_us"),
+            analogue_gain=b.get("analogue_gain"),
+            colour_gains=cg)
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": f"bad value: {e}"}), 400
+    except Exception as e:
+        return jsonify({"error": f"could not apply settings: {e}"}), 500
+
+    requested = {k: b[k] for k in ("exposure_us", "analogue_gain", "colour_gains")
+                 if b.get(k) is not None}
+    return jsonify({"applied": applied, "requested": requested,
+                    "notes": notes, "controls": cam.controls()})
+
+
+# ----------------------------------------------------------------- capture ---
 
 @app.post("/roll")
 def roll():
-    """Capture, crop to the tray, and count dice. Reading happens remotely.
+    """Capture and crop to the tray. Segmentation and reading happen remotely.
 
-    The Pi deliberately does NOT try to read values or even to separate touching
-    dice -- both were measured unreliable here, and the remote model is better at
-    them. What it contributes is an INDEPENDENT COUNT.
+    This used to also run the classical detector to produce an INDEPENDENT
+    COUNT, on the reasoning that with no known dice set to check against, a
+    second opinion was the only thing that could catch the reader silently
+    omitting a die. The reasoning was sound; the detector was not. Measured on
+    an 8-dice tray it reported 20, 27, 36 and finally 73 -- a "second opinion"
+    that is wrong by 9x does not catch omissions, it manufactures false alarms
+    until the alarm is ignored.
 
-    That matters more, not less, now that any number of dice of any type may be
-    rolled: with no known set to check against, this count is the only signal
-    that can catch the reader silently omitting a die. Measured: the plain
-    reading prompt returned 6 values for a 7-dice pile and asserted it
-    confidently.
+    SAM2 does that job now and got 8/8 scattered and 7/7 in a tight pile. It
+    also does it on the workstation's GPU in ~3 s, where the classical pass cost
+    67 s of Pi 3 CPU -- it was the entire reason a capture was not near-instant.
 
-    Counting is cheap and does not require the split to work -- a clump
-    contributes its distance-peak count rather than 1, so a pile of seven still
-    counts as roughly seven.
+    So: crop and hand over the image. Nothing here is on the accuracy path any
+    more, which is why nothing here needs to be fast or clever.
     """
-    body = request.get_json(silent=True) or {}
     img = cam.frame()
     if img is None:
         return jsonify({"error": "no frame yet"}), 503
@@ -490,30 +932,9 @@ def roll():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    gray, channel_note = to_gray(img, quad, body.get("channel", "auto"))
-    dets, rejected, info = detect_all(
-        gray, quad,
-        min_frac=float(body.get("min_frac", 0.002)),
-        max_frac=float(body.get("max_frac", 0.45)),
-        split=bool(body.get("split", True)))
-
-    ref = reference_geometry(dets)
-    blobs = []
-    count = 0
-    for d in dets:
-        peaks = max(1, int(d.get("n_peaks", 1) or 1))
-        # A blob only counts as multiple dice if it is genuinely clump-shaped.
-        # An elongated single d6 reads as two peaks; trusting peaks alone would
-        # inflate the count on ordinary rolls.
-        n = peaks if is_clump(d, ref) else 1
-        count += n
-        blobs.append({"id": d["id"], "bbox": d["bbox"], "area_px": d["area_px"],
-                      "n_peaks": peaks, "counts_as": n,
-                      "suspect_reasons": flag(d, ref)})
-
     # Crop to the tray's bounding box. Everything outside is desk clutter that
     # only gives the reader more chances to hallucinate a die.
-    h, w = gray.shape
+    h, w = img.shape[:2]
     xs, ys = quad[:, 0], quad[:, 1]
     x0, y0 = max(0, int(xs.min())), max(0, int(ys.min()))
     x1, y1 = min(w, int(xs.max())), min(h, int(ys.max()))
@@ -521,20 +942,21 @@ def roll():
     if crop.size == 0:
         return jsonify({"error": "tray crop is empty -- check calibration"}), 400
 
+    _prune()
+    if _free_mb() < MIN_FREE_MB:
+        return jsonify({"error": f"only {_free_mb():.0f} MB free on the Pi"}), 507
     stamp = time.strftime("%Y%m%d-%H%M%S")
     name = f"{stamp}_tray.png"          # lossless: JPEG ringing sits exactly on
-    cv2.imwrite(os.path.join(WORK, name), crop)   # the numeral edges we care about
+    try:                                # the numeral edges we care about
+        _write_image(os.path.join(WORK, name), crop)
+    except IOError as e:
+        return jsonify({"error": str(e)}), 507
 
     return jsonify({
         "id": stamp,
         "tray_image": name,
         "tray_box": [x0, y0, x1, y1],
         "size": [crop.shape[1], crop.shape[0]],
-        "die_count_estimate": count,
-        "blob_count": len(dets),
-        "blobs": blobs,
-        "channel": channel_note,
-        "split": info.get("split"),
         "controls": cam.controls(),
     })
 
@@ -596,6 +1018,13 @@ def serve_file(name):
 
 
 if __name__ == "__main__":
-    print(f"tuning: {os.environ.get('LIBCAMERA_RPI_TUNING_FILE')}", flush=True)
-    print(f"work dir: {WORK}", flush=True)
+    # Log the tuning loudly, and say so when it is wrong. This line reads back
+    # what picamera2 actually gave libcamera; the version that printed our own
+    # environment variable said "noir" while libcamera loaded imx219.json.
+    if cam.tuning_active == NOIR_TUNING:
+        print(f"tuning: {cam.tuning_active}", flush=True)
+    else:
+        print(f"tuning: {cam.tuning_active} -- NOT the NoIR tuning; captures "
+              f"will lose numeral contrast", flush=True)
+    print(f"work dir: {WORK} ({WORK_SOURCE}, {_free_mb():.0f} MB free)", flush=True)
     app.run(host="0.0.0.0", port=8081, threaded=True)

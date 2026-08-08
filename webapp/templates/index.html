@@ -58,6 +58,7 @@
   <span class="pill" id="pTune">tuning …</span>
   <span class="pill" id="pOll">ollama …</span>
   <span class="pill" id="pAnth">anthropic …</span>
+  <span class="pill" id="pSeg">sam2 …</span>
   <span class="pill" id="pCal">calibration …</span>
   <span style="flex:1"></span>
   <button class="act" onclick="refreshStatus()">refresh</button>
@@ -65,7 +66,7 @@
 
 <nav>
   <button class="on" data-t="mount">Mount</button>
-  <button data-t="detect">Detect</button>
+  <button data-t="detect">Segment</button>
   <button data-t="label">Label</button>
   <button data-t="runtime">Runtime</button>
   <button data-t="settings">Settings</button>
@@ -113,6 +114,49 @@
     <div class="card">
       <h2>Camera controls</h2>
       <table id="ctrlTable"><tbody><tr><td class="note">load status…</td></tr></tbody></table>
+
+      <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--edge)">
+        <div class="row" style="margin-bottom:8px">
+          <button class="act p" onclick="expAutoDice()">auto (meter the dice)</button>
+          <button class="act" onclick="expApply()">apply manual</button>
+          <button class="act" onclick="expLockNow()">lock where AE lands</button>
+          <button class="act" onclick="expRelease()">release to AE</button>
+          <span class="note" id="expStatus"></span>
+        </div>
+
+        <label class="sl">exposure &mdash; <span class="mono" id="expUsLbl">?</span></label>
+        <input type="range" id="expUs" min="0" max="1000" value="500" oninput="expLbl()">
+
+        <label class="sl">analogue gain &mdash; <span class="mono" id="expGainLbl">?</span></label>
+        <input type="range" id="expGain" min="100" max="1066" value="100" oninput="expLbl()">
+
+        <label class="sl">white balance: red gain &mdash; <span class="mono" id="expRLbl">?</span></label>
+        <input type="range" id="expR" min="10" max="800" value="100" oninput="expLbl()">
+
+        <label class="sl">white balance: blue gain &mdash; <span class="mono" id="expBLbl">?</span></label>
+        <input type="range" id="expB" min="10" max="800" value="100" oninput="expLbl()">
+
+        <div id="expNotes"></div>
+        <p class="note"><b>auto (meter the dice)</b> searches for the brightest
+          exposure at which the dice faces still stay below saturation, then locks
+          there. It bisects on the live preview inside the tray boundary, so it takes
+          a few seconds and needs the dice to actually be in the tray.</p>
+        <p class="note">Ordinary auto-exposure meters the whole frame. The tray floor
+          is most of that frame and it is dark, so AE raises brightness until the
+          FLOOR is mid-grey &mdash; and the dice, far brighter, blow out. Measured:
+          plain AE clipped <b>0.233%</b> of pixels, essentially all of them on dice
+          faces; highlight metering chose 117 ms at gain 1.0 and clipped
+          <b>0.022%</b>. A clipped numeral is unreadable at any resolution.</p>
+        <p class="note"><b>Exposure time and gain are interchangeable here.</b>
+          Measured on this rig: 47 ms at gain 4.8 and 227 ms at gain 1.0 gave the
+          same floor brightness (131.6 vs 132.1), the same noise (3.26 vs 3.33) and
+          the same clipping (0.23% vs 0.25%). The dice are stationary, so a long
+          exposure costs nothing but preview frame rate. Pick whichever you like and
+          spend the effort on total brightness instead.</p>
+        <p class="note">Clipping is what to avoid: at gain 1.0, 110 ms clipped no
+          pixels at all, 160 ms clipped 0.06% and 227 ms clipped 0.33%. A clipped
+          numeral is unreadable at any resolution.</p>
+      </div>
     </div>
   </div>
 </section>
@@ -120,41 +164,38 @@
 <!-- ------------------------------------------------------------ DETECT -->
 <section id="detect">
   <div class="grid">
-    <div class="card">
-      <h2>Detection parameters</h2>
-      <label class="sl">variance window — blank = scales with tray size</label>
-      <input id="pWindow" class="mono" placeholder="auto" style="width:100%;background:#0e1116;color:var(--ink);border:1px solid var(--edge);border-radius:5px;padding:5px">
-      <label class="sl">min blob area — <span id="vMin">0.20</span>% of tray</label>
-      <input type="range" id="pMin" min="1" max="30" value="20">
-      <label class="sl">max blob area — <span id="vMax">6.0</span>% of tray</label>
-      <input type="range" id="pMax" min="10" max="200" value="60">
-      <label class="sl">crop context — <span id="vCtx">1.5</span>× the bounding box</label>
-      <input type="range" id="pCtx" min="10" max="50" value="15">
-      <p class="note">Both ends fail, for different reasons. Too tight and the
-        crop is a numeral with no die around it — a reader cannot tell which
-        face is up. Too wide and the crop contains several dice, so there is no
-        single right answer. If no value works, the detection is bounding
-        digits rather than dice, which is a <i>lighting</i> problem.</p>
-      <label class="sl"><input type="checkbox" id="pSplit" checked> watershed split for touching dice</label>
-      <p class="note">The split only applies if it increases the number of
-        <i>clean single dice</i>. It will refuse otherwise — watershed
-        over-segments happily, and more blobs is not the goal.</p>
-      <div class="row" style="margin-top:11px">
-        <button class="act p" onclick="capture()">capture &amp; detect</button>
-        <button class="act" onclick="reanalyze()">re-detect last</button>
+    <div class="card" style="grid-column:1/-1">
+      <h2>Segmentation (SAM2)</h2>
+      <div class="row">
+        <button class="act p" onclick="runSegment()">capture &amp; segment</button>
+        <span class="note" id="segStatus"></span>
       </div>
-      <p class="note" id="detStatus"></p>
+      <p class="note">Segmentation only &mdash; no reading, so this costs a few seconds
+        instead of minutes. When a roll comes back wrong this is the first question to
+        ask, because a mask that merged two dice and a reader that misread a clean crop
+        produce the same symptom. If the dice are each separately tinted below,
+        segmentation was fine and the fault is in the reading.</p>
+      <p class="note">The old variance/watershed controls are gone. They tuned a method
+        that counted 20 dice for 8 and could not split touching dice at all; SAM2
+        separated 7/7 of a tight pile. Keeping the sliders would only invite re-tuning
+        something already measured and rejected.</p>
+      <div id="segSummary" style="margin-top:10px"></div>
     </div>
 
     <div class="card" style="grid-column:1/-1">
-      <h2>Result</h2>
-      <div id="detSummary"></div>
-      <img class="view" id="overlay" style="margin-top:10px" alt="">
+      <h2>Masks</h2>
+      <img class="view" id="segOverlay" alt="">
+      <p class="note">Each die tinted a different colour is a separate mask. Two dice
+        sharing one tint is a merge; a tinted patch of tray is a false positive.</p>
     </div>
 
     <div class="card" style="grid-column:1/-1">
-      <h2>Crops</h2>
+      <h2>Isolated crops &mdash; exactly what the reader receives</h2>
       <div id="detCrops" class="crops"></div>
+      <p class="note">Each die is composited onto neutral grey through its mask, so
+        neighbouring dice are gone rather than merely cropped around. Grey rather than
+        black or white: a hard black border is an artificial edge a reader latches onto,
+        and white blows out against pale dice. These same crops populate the Label tab.</p>
     </div>
   </div>
 </section>
@@ -193,7 +234,8 @@
     <div class="card" style="grid-column:1/-1">
       <h2>Read a roll</h2>
       <div class="row">
-        <button class="act p" onclick="readRoll()">read roll now</button>
+        <button class="act p" onclick="readRoll(true)">read roll (SAM2)</button>
+        <button class="act" onclick="readRoll(false)">whole-tray (old)</button>
         <select id="rollProvider" style="background:#0e1116;color:var(--ink);border:1px solid var(--edge);border-radius:6px;padding:6px">
           <option value="">auto: Claude Code, then Anthropic, then Ollama</option>
           <option value="claude-code">Claude Code</option>
@@ -202,7 +244,12 @@
         </select>
         <span class="note" id="rollStatus"></span>
       </div>
-      <p class="note">Pi captures and counts; <code>{{ vision_model }}</code>
+      <p class="note"><b>SAM2</b> segments each die out of the tray and the reader sees
+        one isolated die at a time -- measured 8/8 dice and 7/7 of a tight pile in ~3s,
+        against a distance-transform count that reported 20 dice for 8. Reads are
+        batched into one call per prompt variant, not one per die.
+        The <b>whole-tray</b> button is the older path, kept for comparison.<br>
+        Pi captures and counts; <code>{{ vision_model }}</code>
         reads. Three <b>different</b> prompts are used, not three repeats —
         at temperature 0 the same prompt returns identical output every time, so
         repetition proves nothing. Confidence comes from where the prompts
@@ -340,7 +387,7 @@
 
 <script>
 const PI = {{ pi_base|tojson }};
-let lastId = null, lastCrops = [], pts = [], calNat = null, suggestions = {};
+let lastId = null, lastCrops = [], cropVersion = null, pts = [], calNat = null, suggestions = {};
 
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('nav button').forEach(x => x.classList.remove('on'));
@@ -348,10 +395,6 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   b.classList.add('on');
   document.getElementById(b.dataset.t).classList.add('on');
 });
-pMin.oninput = () => vMin.textContent = (pMin.value/100).toFixed(2);
-pMax.oninput = () => vMax.textContent = (pMax.value/10).toFixed(1);
-pCtx.oninput = () => vCtx.textContent = (pCtx.value/10).toFixed(1);
-
 const j = async (u,o) => (await fetch(u,o)).json();
 const piPost = (e,b={}) => j('/api/pi/'+e,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
 const piGet  = e => j('/api/pi/'+e);
@@ -389,6 +432,14 @@ async function refreshStatus(){
             : a.key_present ? 'anthropic ('+(a.key_source||'?')+')'
             : 'no anthropic credential';
   setPill(pAnth, lbl, (a.code_token_present||a.key_present) ? 'ok' : 'warn');
+  try {
+    const sg = await j('/api/seg/health');
+    setPill(pSeg, sg.ok ? ('sam2 ' + (sg.cuda ? 'gpu' : 'CPU')) : 'sam2 down', sg.ok ? 'ok' : 'warn');
+    if (sg.ok && !sg.cuda)
+      B.push('<div class="banner warn">SAM2 is running on CPU. Segmentation will be far slower than the ~3s measured on the GPU.</div>');
+    if (!sg.ok)
+      B.push('<div class="banner warn">SAM2 service is down, so the SAM2 button will fail. Start it with <code>.venv-ml\\Scripts\\python.exe webapp\\seg_service.py</code></div>');
+  } catch(e) { setPill(pSeg, 'sam2 down', 'warn'); }
   banners.innerHTML = B.join('');
 }
 
@@ -462,86 +513,93 @@ async function framing(){
   framingOut.innerHTML = h;
 }
 
-async function capture(){
-  detStatus.textContent = 'capturing…';
-  const c = await piPost('capture');
-  if (c.error){ detStatus.textContent = c.error; return; }
-  lastId = c.id; await runAnalyze();
-}
-async function reanalyze(){
-  if (!lastId){ detStatus.textContent = 'nothing captured yet'; return; }
-  await runAnalyze();
-}
-async function runAnalyze(){
-  detStatus.textContent = 'detecting… (a few seconds on a Pi 3)';
-  const body = { id: lastId, min_frac: pMin.value/10000, max_frac: pMax.value/1000,
-                 split: pSplit.checked, context: pCtx.value/10 };
-  if (pWindow.value.trim()) body.window = parseInt(pWindow.value);
-  const r = await piPost('analyze', body);
-  if (r.error){ detStatus.textContent = r.error;
-    detSummary.innerHTML = `<div class="banner bad">${r.error}</div>`; return; }
-  detStatus.textContent = '';
-  detSummary.innerHTML = `<table>
-    <tr><th>blobs</th><td class="mono">${r.detections.length}</td></tr>
-    <tr><th>clean</th><td class="mono" style="color:var(--ok)">${r.clean}</td></tr>
-    <tr><th>suspect</th><td class="mono" style="color:var(--warn)">${r.suspect}</td></tr>
-    <tr><th>rejected</th><td class="mono">${r.rejected.too_small} too small, ${r.rejected.too_large} too large</td></tr>
-    <tr><th>watershed</th><td class="mono">${r.split || 'n/a'}</td></tr></table>`;
-  overlay.src = PI + '/file/' + r.overlay + '?t=' + Date.now();
-  lastCrops = r.crops; suggestions = {};
-  renderCrops(detCrops, false); renderCrops(labelCrops, true);
-}
-
 function renderCrops(el, editable){
-  if (!lastCrops.length){ el.innerHTML = '<div class="empty">No crops yet — capture and detect first.</div>'; return; }
+  if (!lastCrops.length){ el.innerHTML = '<div class="empty">No crops yet \u2014 run capture &amp; segment on the Segment tab.</div>'; return; }
   el.innerHTML = lastCrops.map(c => {
-    const s = suggestions[c.file];
-    return `<div class="crop ${c.suspect?'sus':'clean'}">
-      <img src="${PI}/file/${c.file}" title="${(c.reasons||[]).join('; ')}">
-      <div class="meta">#${c.id} ${c.suspect?'<span style="color:#f85149">suspect</span>':'<span style="color:#3fb950">clean</span>'}
-      ${editable ? `<input id="lb_${c.id}" placeholder="value" value="${s&&s.value!=null?s.value:''}">
-        ${s?`<div class="note" style="margin:2px 0 0">${s.provider||'?'}: ${s.raw} (${s.seconds}s)</div>`:''}` : ''}
+    const s = suggestions[c.key];
+    return `<div class="crop clean">
+      <img src="data:image/png;base64,${c.crop}" title="${c.area} px">
+      <div class="meta">#${c.id} <span class="note">${c.area} px</span>
+      ${editable ? `<input id="lb_${c.id}" name="die-face-${c.id}" placeholder="value" inputmode="numeric" autocomplete="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore data-bwignore value="${s&&s.value!=null?s.value:''}">
+        ${s?`<div class="note" style="margin:2px 0 0">${s.die_type||'?'} — ${s.provider||'?'} ${s.seconds}s</div>`:''}` : ''}
       </div></div>`;
   }).join('');
 }
 
 async function suggestAll(){
-  if (!lastCrops.length){ labelStatus.textContent = 'no crops — capture first'; return; }
+  if (!lastCrops.length){ labelStatus.textContent = 'no crops \u2014 capture & segment first'; return; }
   for (const c of lastCrops){
-    labelStatus.textContent = `reading ${c.file}…`;
+    labelStatus.textContent = `reading ${c.key}\u2026`;
     const r = await j('/api/suggest',{method:'POST',headers:{'Content-Type':'application/json'},
-                                     body:JSON.stringify({crop:c.file,
+                                     body:JSON.stringify({image:c.crop,
                                                           provider: labelProvider.value || null})});
-    if (!r.error) suggestions[c.file] = r;
+    if (!r.error) suggestions[c.key] = r;
     renderCrops(labelCrops, true);
   }
-  labelStatus.textContent = 'suggestions in — check every one before saving.';
+  labelStatus.textContent = 'suggestions in \u2014 check every one before saving.';
 }
 
 async function saveAllLabels(){
-  let n = 0;
+  let n = 0; const failed = [];
   for (const c of lastCrops){
     const el = document.getElementById('lb_'+c.id);
     if (!el || !el.value.trim()) continue;
-    await j('/api/label',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({crop:c.file, label:el.value.trim(), source:lastId,
-                           suggested:(suggestions[c.file]||{}).value})});
-    n++;
+    const r = await j('/api/label',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({crop:c.key, image:c.crop, label:el.value.trim(), source:lastId,
+                           die_type:(suggestions[c.key]||{}).die_type,
+                           crop_version:cropVersion,
+                           suggested:(suggestions[c.key]||{}).value})});
+    // Count what the server accepted, not what was sent. The previous version
+    // incremented unconditionally and would report "saved 8" when the server
+    // had rejected some of them -- the one situation where a labelling tool
+    // must not be reassuring.
+    if (r && r.saved){ n++; el.style.borderColor = ''; }
+    else { failed.push(`#${c.id}: ${(r && r.error) || 'save failed'}`);
+           el.style.borderColor = 'var(--bad)'; }
   }
-  labelStatus.textContent = `saved ${n} label(s) to dataset/labels.jsonl`;
+  labelStatus.innerHTML = failed.length
+    ? `saved ${n}, <span style="color:var(--bad)">${failed.length} rejected</span> — ${failed.join('; ')}`
+    : `saved ${n} label(s) to dataset/labels.jsonl`;
 }
 
-async function readRoll(){
-  rollStatus.textContent = 'capturing, counting, reading (3 prompts)…';
+async function readRoll(phase1){
+  if (phase1 === undefined) phase1 = true;
+  rollStatus.textContent = phase1
+    ? 'capturing, segmenting with SAM2, reading each die...'
+    : 'capturing, counting, reading...';
   rollOut.innerHTML = '';
-  const r = await j('/api/roll',{method:'POST',headers:{'Content-Type':'application/json'},
-                                 body:JSON.stringify({provider: rollProvider.value || null})});
+  const r = await j(phase1 ? '/api/roll2' : '/api/roll',
+                   {method:'POST',headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({provider: rollProvider.value || null})});
   if (r.error){ rollStatus.textContent=''; rollOut.innerHTML = `<div class="banner bad">${r.error}</div>`; return; }
   rollStatus.textContent = `${r.seconds}s`;
   rollImg.src = PI + '/file/' + r.capture.tray_image + '?t=' + Date.now();
 
   let h = '';
   (r.issues||[]).forEach(i => h += `<div class="banner bad">${i}</div>`);
+
+  if (phase1){
+    const low = r.dice.filter(d=>d.confidence==='low').length;
+    if (!r.issues.length && !low)
+      h += `<div class="banner" style="background:#0f2f16;border:1px solid #1d572b;color:#7ee787">All ${r.count} dice agreed across every reading.</div>`;
+    h += `<table><tr><th>#</th><th>type</th><th>value</th><th>confidence</th><th></th></tr>`;
+    r.dice.forEach(d => {
+      h += `<tr><td class="mono">${d.id}</td>
+        <td class="mono">${d.type||'?'}</td>
+        <td class="mono" style="font-size:18px">${d.value!=null?d.value:'?'}</td>
+        <td style="color:${d.confidence==='high'?'var(--ok)':'var(--warn)'}">${d.confidence}</td>
+        <td class="note">${d.note||''}</td></tr>`;
+    });
+    h += `</table><table style="margin-top:10px">
+      <tr><th>read by</th><td class="mono">${r.provider} / ${r.model}</td></tr>
+      <tr><th>SAM2 found</th><td class="mono">${r.count} dice (from ${r.raw_masks} raw masks) in ${r.seg_seconds}s</td></tr>
+      <tr><th>total</th><td class="mono">${r.seconds}s</td></tr></table>`;
+    rollOut.innerHTML = h;
+    rollImg.src = PI + '/file/' + r.capture.tray_image + '?t=' + Date.now();
+    loadRolls();
+    return;
+  }
+
   const lows = r.dice.filter(d=>d.confidence==='low').length;
   if (!r.issues.length && !lows) h += `<div class="banner" style="background:#0f2f16;border:1px solid #1d572b;color:#7ee787">All ${r.total} dice agreed across every reading.</div>`;
 
@@ -558,7 +616,6 @@ async function readRoll(){
       <td class="note">readings disagree; candidates ${Object.keys(r.disputed||{}).join(', ')||'—'}</td></tr>`;
   h += `</table>`;
   h += `<table style="margin-top:10px"><tr><th>read by</th><td class="mono">${r.provider||'?'} / ${r.model||'?'}</td></tr>
-        <tr><th>camera counted</th><td class="mono">${r.pi_count} dice</td></tr>
         <tr><th>readings suggest</th><td class="mono">${r.expected_dice}</td></tr>
         <tr><th>read confidently</th><td class="mono">${r.total}</td></tr>
         <tr><th>agreement</th><td class="mono">${Math.round(r.agreement*100)}%</td></tr></table>`;
@@ -681,7 +738,120 @@ async function saveModel(){
   modelMsg.textContent='saved.'; loadSettings(); refreshStatus();
 }
 
-refreshStatus(); startLive(); loadRolls(); loadSettings(); setInterval(refreshStatus, 20000);
+async function runSegment(){
+  segStatus.textContent = 'capturing and segmenting\u2026';
+  segSummary.innerHTML = ''; detCrops.innerHTML = '';
+  const r = await j('/api/segment',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  if (r.error){ segStatus.textContent=''; segSummary.innerHTML = `<div class="banner bad">${r.error}</div>`; return; }
+  segStatus.textContent = `${r.seconds}s total, ${r.seg_seconds}s segmenting`;
+  if (r.overlay) segOverlay.src = 'data:image/jpeg;base64,' + r.overlay;
+  lastId = (r.capture||{}).id || null;
+  cropVersion = r.crop_version || null;
+  const rj = r.rejected || {};
+  segSummary.innerHTML = `<table>
+    <tr><th>dice found</th><td class="mono" style="font-size:18px">${r.count}</td></tr>
+    <tr><th>raw masks</th><td class="mono">${r.raw_masks} <span class="note">before filtering</span></td></tr>
+    <tr><th>rejected</th><td class="mono">${rj.area||0} by area, ${rj.border||0} touching the frame edge, ${rj.shape||0} by shape, ${rj.nested||0} nested inside another</td></tr>
+    <tr><th>model</th><td class="mono">${r.model}</td></tr>
+    <tr><th>capture</th><td class="mono">${lastId||'?'}</td></tr></table>`;
+  // key: what a label is filed under, and stable across a page reload because
+  // it is built from the capture id rather than an array position.
+  lastCrops = (r.crops||[]).map(c => Object.assign({key: `${lastId}-${c.id}`}, c));
+  suggestions = {};
+  renderCrops(detCrops, false); renderCrops(labelCrops, true);
+}
+
+// Exposure spans 75us..2s, so a linear slider would spend 95% of its travel
+// above 100ms. Log scale gives even resolution across the useful range.
+let expLimits = null;
+const EXP_LO = 75, EXP_HI = 2000000;
+const sliderToUs = v => Math.round(EXP_LO * Math.pow(EXP_HI/EXP_LO, v/1000));
+const usToSlider = us => Math.round(1000 * Math.log(us/EXP_LO) / Math.log(EXP_HI/EXP_LO));
+
+function expLbl(){
+  const us = sliderToUs(+expUs.value);
+  expUsLbl.textContent = us >= 1000 ? `${(us/1000).toFixed(1)} ms` : `${us} µs`;
+  const fps = 1e6/us;
+  if (fps < 15) expUsLbl.textContent += `  (preview ≤ ${fps.toFixed(1)} fps)`;
+  expGainLbl.textContent = (+expGain.value/100).toFixed(2) + '×';
+  expRLbl.textContent = (+expR.value/100).toFixed(2);
+  expBLbl.textContent = (+expB.value/100).toFixed(2);
+}
+
+async function loadExposure(){
+  const r = await piGet('exposure');
+  if (r.error) return;
+  expLimits = r.limits || {};
+  const c = r.controls || {};
+  if (c.exposure_us) expUs.value = usToSlider(c.exposure_us);
+  if (c.analogue_gain) expGain.value = Math.round(c.analogue_gain*100);
+  if (c.colour_gains){ expR.value = Math.round(c.colour_gains[0]*100);
+                       expB.value = Math.round(c.colour_gains[1]*100); }
+  const g = expLimits.AnalogueGain;
+  if (g) expGain.max = Math.round(g.max*100);
+  expLbl();
+}
+
+async function expApply(){
+  expStatus.textContent = 'applying…'; expNotes.innerHTML = '';
+  const r = await piPost('exposure', {
+    exposure_us: sliderToUs(+expUs.value),
+    analogue_gain: +expGain.value/100,
+    colour_gains: [+expR.value/100, +expB.value/100]});
+  if (r.error){ expStatus.textContent=''; expNotes.innerHTML = `<div class="banner bad">${r.error}</div>`; return; }
+  const a = r.applied || {};
+  expStatus.textContent = `applied ${a.exposure_us} µs @ ${a.analogue_gain}×`;
+  // Snap the sliders to what the sensor actually did, not what was asked. The
+  // sensor quantises exposure to whole line times, so leaving the slider on the
+  // request would show a value the camera never used.
+  if (a.exposure_us) expUs.value = usToSlider(a.exposure_us);
+  if (a.analogue_gain) expGain.value = Math.round(a.analogue_gain*100);
+  expLbl();
+  if (r.notes && r.notes.length)
+    expNotes.innerHTML = r.notes.map(n=>`<div class="banner warn">${n}</div>`).join('');
+  refreshStatus();
+}
+
+async function expAutoDice(){
+  expStatus.textContent = 'metering the dice… (bisecting, ~20s)'; expNotes.innerHTML = '';
+  const r = await piPost('autoexpose', {});
+  if (r.error){ expStatus.textContent=''; expNotes.innerHTML = `<div class="banner bad">${r.error}</div>`; return; }
+  const a = r.applied || {};
+  expStatus.textContent = `locked at ${a.exposure_us} µs @ ${a.analogue_gain}×`;
+  await loadExposure();
+  let h = '';
+  if (r.notes && r.notes.length) h += r.notes.map(n=>`<div class="banner warn">${n}</div>`).join('');
+  if (r.trace && r.trace.length){
+    h += `<table style="margin-top:8px"><tr><th>exposure</th><th>dice top</th><th>floor</th><th>clipped</th></tr>` +
+      r.trace.map(t=>`<tr><td class="mono">${t.exposure_us} µs</td>
+        <td class="mono" style="color:${t.dice_top>=250?'var(--bad)':'var(--ok)'}">${t.dice_top}</td>
+        <td class="mono">${t.floor}</td><td class="mono">${t.clipped_pct}%</td></tr>`).join('') +
+      `</table><p class="note">The search, brightest first. "dice top" is the 99.5th
+       percentile inside the tray; it has to stay under 245. Saturated early steps
+       are the bisection finding its bracket, not a fault.</p>`;
+  }
+  expNotes.innerHTML = h;
+  refreshStatus();
+}
+
+async function expRelease(){
+  expStatus.textContent = 'releasing to free-running AE…'; expNotes.innerHTML = '';
+  await piPost('unlock');
+  setTimeout(async()=>{ await loadExposure();
+    expStatus.textContent = 'free-running AE (drifting, and it blows out the dice)';
+    refreshStatus(); }, 2500);
+}
+
+async function expLockNow(){
+  expStatus.textContent = 'locking…'; expNotes.innerHTML = '';
+  const r = await piPost('lock');
+  if (r.error){ expStatus.textContent=''; expNotes.innerHTML = `<div class="banner bad">${r.error}</div>`; return; }
+  await loadExposure();
+  expStatus.textContent = 'locked where auto-exposure landed';
+  refreshStatus();
+}
+
+refreshStatus(); startLive(); loadRolls(); loadSettings(); setInterval(refreshStatus, 20000); loadExposure();
 </script>
 </body>
 </html>

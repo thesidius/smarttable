@@ -1,6 +1,12 @@
 # Dice reading pipeline
 
-## Stage 1 — detection (working)
+> **The classical path described in Stages 1–1.5 was deleted on 2026-08-07.**
+> SAM2 replaced it; see *The camera count is retired* below for what went and
+> why. Those sections are kept as the record of what was tried and measured —
+> the local-variance finding is still true, it just was not enough — but
+> `dice_detect.py` no longer exists and none of it runs.
+
+## Stage 1 — detection (superseded, kept as history)
 
 `pi-tower/dice_detect.py`. Turns a tray frame into per-die crops plus a JSON
 manifest.
@@ -342,6 +348,244 @@ Pair it with the Pi's own blob/peak count as an independent estimate of how many
 dice are present. Under this constraint that count is **more** valuable, not
 less: with no known dice count, it is the only signal that can catch the model
 silently omitting a die.
+
+## Phase 0 RESULT — SAM2 passes the gate (2026-08-06)
+
+`pi-tower/sam2_phase0.py`, SAM2.1-base, automatic mask generation, RTX 4090.
+Run per `docs/instance-segmentation-plan.md`.
+
+| frame | truth | raw masks | after filter | time | separation |
+|---|---|---|---|---|---|
+| 8 dice, some touching | 8 | 18 | 9 | **2.4 s** | **8/8, no merges** |
+| 8 scattered (4 d12, 4 d20) | 8 | 15 | 10 | **1.4 s** | **8/8** |
+| **7 in a tight pile** | 7 | 11 | 8 | **1.4 s** | **7/7 separated** |
+
+Every gate criterion met:
+
+| criterion | target | measured |
+|---|---|---|
+| scattered dice | ≥7/8, no merges | 8/8 |
+| **tight pile** | **≥5/7 separated** | **7/7** |
+| false positives | ≤1/frame | +1, +2, +1 |
+| latency | <5 s | 1.4–2.4 s |
+
+**The pile row is the one that matters, and it is not close.** Every die in a
+seven-die pile received its own mask. The watershed on the same class of frame
+lost 27–52% of the pile and was correctly rejected by its own guard every time.
+This is the case that is impossible for distance-transform methods and routine
+for a learned model.
+
+The residual +1/+2 are almost certainly tray floor or shadow surviving the area
+band; the plan's quad filter (skipped here because these are already tray crops)
+should remove them on full frames.
+
+### Head-to-head against the VLM bounding-box result
+
+| approach | separation | time | gives type? | needs |
+|---|---|---|---|---|
+| distance-transform peaks | fails; reported 20 dice for 8 | ~0 | no | — |
+| VLM boxes (Claude Code, opus) | 8/8 incl. 4-die cluster | **263 s** | **yes** | API round-trip |
+| **SAM2.1-base** | **8/8 and 7/7 pile** | **1.4–2.4 s** | **no** | local GPU |
+
+SAM2 is ~110x faster and returns *masks* rather than boxes, which matters
+because the plan crops from the mask — that is what removes the neighbouring
+dice that caused the misreads. It is class-agnostic, so it does not answer "d12
+or d20"; the VLM does. They are complementary, which is exactly the Phase 1
+split: SAM2 separates, the VLM reads type and value from a clean crop.
+
+### Toolchain note
+
+The plan assumed a working GPU stack. There wasn't one: the default Python here
+is **3.14, for which no CUDA torch wheel exists** — the installed torch was
+CPU-only, and Ollama reaches the 4090 through its own bundled runtime rather
+than this environment. Fixed with a separate Python **3.13** venv
+(`.venv-ml/`, gitignored) carrying `torch 2.13.0+cu126` and
+`ultralytics 8.4.116`.
+
+One API correction: `points_stride` is a parameter of `Predictor.generate()`,
+**not** a call kwarg. Passing it to `model(...)` fails validation with "not a
+valid YOLO argument". The default is already 32, so it only needs the predictor
+route when overriding.
+
+## Phase 1 BUILT — SAM2 separates, the VLM reads isolated dice
+
+```
+Pi /roll -> tray image -> seg_service /segment -> N isolated die crops
+                                                      |
+                          per-crop VLM read (2 prompts) -> type + value + confidence
+```
+
+- `webapp/seg_service.py` — SAM2 on the 4090, port 8090, **its own interpreter**
+  (`.venv-ml`, Python 3.13). The control panel is on 3.14, which has no CUDA
+  torch wheel. A service rather than a subprocess so the model loads once.
+- `webapp/app.py` `POST /api/roll2` — the Phase 1 pipeline.
+- `read_segmented()` in `roll_reader.py` — per-crop reading.
+
+**Crops are mask-composited onto neutral grey, not bounding-box cut-outs.** That
+is the whole point: a box around a die in a pile still contains its neighbours,
+and neighbours are what caused the misreads. Grey rather than black or white
+because a hard black border is an artificial edge the reader latches onto, and
+white blows out against pale dice; mid-grey sits between the darkest (~20) and
+palest (~180+) dice measured here.
+
+### Measured, live
+
+| stage | result |
+|---|---|
+| segmentation | **8/8 dice, 0 false positives**, 17 raw masks filtered to 8, **3.09 s** |
+| reading (haiku, 2 prompts each) | works; 6/10 low-confidence on an earlier run |
+| **total** | **295 s** — segmentation is 1%, reading is the rest |
+
+### The filters that matter
+
+The first live run returned three false positives: a thin tray-edge sliver, a
+**LEGO brick sitting outside the tray**, and an empty corner. All three touched
+the frame border — and no die can, because the tray walls are inside the crop.
+Adding border rejection plus a shape test (aspect 0.45–2.2, mask/bbox fill
+≥0.45; a die fills ~0.7–0.8 of its box, a sliver ~0.1) took it to zero.
+
+Note this is *because* the tray quad covers the walls rather than the floor —
+the right call, since a die can rest against a wall, but it means the crop
+contains wall and whatever is beyond it.
+
+### Batched reads — measured, and it works
+
+One call per prompt variant covering every die, instead of one call per die.
+Isolated properly (same model, same rig, per-die vs batched):
+
+| config | dice | total | segmentation | high-confidence |
+|---|---|---|---|---|
+| haiku, per-die | 10 | 295 s | ~3 s | 4/10 |
+| **haiku, batched** | 8 | **76 s** | 8.3 s | 4/8 |
+| opus, batched | 8 | **1035 s** | 2.6 s | **7/8** |
+| ollama gemma3, batched | 8 | 442 s | 2.7 s | 5/8 |
+
+**Batching is ~3x faster per die** (haiku 295 s → 76 s). Most of that was
+`claude -p` subprocess and agent startup paid 16 times instead of twice.
+
+**No configuration is yet both fast and accurate.** Opus gets the d12/d20 split
+right — 4 and 4, 7/8 dice agreeing across prompts — and takes 17 minutes.
+Haiku is 13x faster and only half its dice agree. Ollama manages to be *both*
+slower than haiku and less accurate, calling 6 of 8 dice d20; local and free is
+its only remaining argument.
+
+An earlier note here compared 295 s against 1035 s as if it showed batching
+made things worse. It did not — two variables changed at once (per-die→batched
+AND haiku→opus). The haiku-batched row is what isolates it.
+
+### The Anthropic API path is the untested cell
+
+`claude -p` is an agent: it starts up, plans, and reads files as tool calls.
+The Messages API sends the same images to the same model with none of that.
+Opus's accuracy at a fraction of 1035 s is the plausible win, and it is the one
+configuration in the matrix nobody has measured — it needs an `sk-ant-api` key,
+which is not the OAuth token currently configured.
+
+### The camera count is retired — and with it the whole classical path (2026-08-07)
+
+Across these runs the Pi's distance-transform count reported **20**, **27**,
+**36** and finally **73** dice for 8. A cross-check wrong by 9x does not catch
+the reader omitting a die; it raises a mismatch on every single roll until the
+warning means nothing. Removed from `/api/roll2`, from `reconcile()`, and from
+both result tables.
+
+Removing the count removed the only caller of the classical detector, so that
+went too:
+
+| removed | was |
+|---|---|
+| `pi-tower/dice_detect.py` | 42 KB: local-variance segmentation, watershed split, distance-transform counting, shape heuristics |
+| `POST /analyze` on the Pi | the endpoint the Detect tab's sliders drove |
+| `_resolve_frame()` | re-run detection on a stored capture |
+| `pi-tower/crop_pipeline.py` | training-data CLI whose detection half was that module |
+| Detect-tab controls | variance window, min/max blob area, crop context, watershed toggle |
+
+What survived is `pi-tower/tray_geometry.py` — just `fit_quad_to_frame()`,
+which was never about detection. It converts a tray calibration measured at one
+resolution into another, and refuses when the aspect ratio differs. `/roll` and
+`/framing` both still need it, and it is still the guard that turns a silent
+quarter-of-the-tray mask into an error.
+
+Three things the plan listed under **Keep** were not kept, deliberately:
+
+- **`quad_scale()` and `REF_TRAY_W`.** They existed to scale morphology kernel
+  sizes with resolution. There is no morphology left, so there is no kernel to
+  scale — and a scaling helper with no consumer is precisely the dead code the
+  plan warns about. The *discipline* the plan actually wanted is in
+  `fit_quad_to_frame()`, which refuses rather than silently rescaling across a
+  changed field of view. That is kept.
+- **`to_gray()`'s per-frame channel selection.** Genuinely a good finding —
+  under coloured light, OpenCV's fixed BGR2GRAY weights can hand 59% of the
+  signal to a dead channel — but nothing calls it now. The finding is recorded
+  here; the code was not worth keeping alive for a hypothetical caller.
+- **`crop_pipeline.py`'s crop conventions.** Kept, but *moved* rather than
+  retained: they are the docstring of `seg_service._crop()`, which is where
+  cropping actually happens now. One convention was deliberately dropped —
+  see below.
+
+`crop_pipeline` normalised every crop to a fixed side so a classifier could not
+cheat by learning "big blob = d20". `_crop()` does not, because these crops go
+to a vision model and downsampling a 625 px die to a common size throws away
+exactly the numeral resolution that decides the read. The PNGs are stored at
+native size; normalise at training time if a classifier ever wants them.
+
+**Provenance stamping was kept, and immediately earned its place.**
+`CROP_VERSION` is recorded with every label. It went from 1 to 2 on the same
+day the labelling flow was built, because the stray-pixel fix below re-framed
+every crop — labels collected either side of that change are against different
+images, and without the stamp there would be no way to tell which were which.
+
+**The Pi's `/roll` went from 67 s to 1.6 s.** That classical pass was the entire
+reason a capture was not near-instant; it was burning 67 s of Pi 3 CPU to
+produce a number that was wrong by 9x. Capture-and-segment end to end is now
+**6.5 s**, down from ~47 s.
+
+The Detect tab was repurposed as **Segment**: capture and segment with no
+reading, showing the tinted mask overlay and the isolated crops. Segmentation
+costs seconds where reading costs minutes, and when a roll comes back wrong,
+"a mask merged two dice" and "the reader misread a clean crop" produce the
+identical symptom. Being able to rule out the first for 6 s is the point.
+
+### Two defects the overlay and the crops exposed
+
+**Stray-pixel masks.** SAM2 masks routinely carry a few pixels tens of percent
+of the frame away from the die. Far too small to trip the area filter — but
+min/max over the raw coordinates is decided by the single most distant pixel,
+so one speck off-centres and inflates the crop. Measured: a d20 was pushed into
+the right-hand third of its own 1045 px crop, throwing away most of the
+resolution the reader gets. Keeping only the largest connected component fixed
+it: same die, 625 px, filling the frame. It also cleaned up the shape filter,
+which computes fill and aspect from the same bounding box.
+
+**The overlay was unreadable.** Tinting each mask a random colour at 45% over
+dice that already carry strong colour produced a wash — two adjacent dice got
+near-identical tints, which is exactly the case the overlay exists to catch.
+Now: background dimmed to 38% so an unsegmented die is visibly dark, a fixed
+well-separated palette, and a hard outline per mask. Two dice inside one
+outline reads instantly.
+
+**Digit scraping in `/api/suggest`.** `"".join(c for c in raw if c.isdigit())`
+over `{"type":"d20","value":4}` yields **204**. That pre-filled the Label tab's
+input with a wrong value for a human to rubber-stamp into the training set —
+the worst possible place for a silent error. Now parsed with `_parse()`, which
+already existed for the roll path, and the die type is surfaced alongside.
+
+### Labels now point at images that exist
+
+SAM2 crops are composited in memory on the workstation and never written to the
+Pi, so a label naming a Pi filename would point at nothing. `/api/label` takes
+the inline image and writes it under `dataset/crops/`, keyed by capture id and
+mask index. A label log whose crops cannot be reopened is useless as training
+data, which is the only reason to be labelling.
+
+### The bottleneck moved
+
+Segmentation is no longer the problem; it is 1% of the time. The cost is now
+**N dice × 2 prompts sequential VLM calls** — 16 subprocess launches for 8 dice.
+
+The obvious fix is batching: `claude -p` can be handed several image files in
+one call, turning 16 launches into one. Untested, but it is the difference
+between ~295 s and something usable at a table.
 
 ## Die-type identification by SHAPE, not numbers
 

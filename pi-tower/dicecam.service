@@ -1,0 +1,50 @@
+[Unit]
+Description=Dice tower camera head (Pi camera + HTTP control)
+Documentation=https://github.com/thesidius/smarttable
+
+# Ordering after the storage mount is the part that matters. camera_service.py
+# picks its work directory ONCE, at import, and falls back to the SD card if
+# the USB stick is not mounted yet. That SD card is 7.4 GB and has already
+# filled to 100% once, at which point cv2.imwrite silently wrote nothing and
+# the failure surfaced minutes later as "no such capture" on an unrelated
+# screen. Racing the mount would reintroduce exactly that.
+#
+# This only works because the stick is in /etc/fstab. Left to udisks2 it mounts
+# when a desktop session logs in, which is far too late and not guaranteed.
+#
+# After= WITHOUT Requires= is deliberate. If the stick is genuinely absent the
+# service should still start on the SD card and say so via work_source in
+# /health -- a camera that refuses to run because a USB stick was pulled is a
+# worse failure than one that runs with less space and reports it.
+After=network-online.target media-paul-pi_storage.mount
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=paul
+Group=paul
+WorkingDirectory=/home/paul/pi-tower
+
+# Launch through the script, never python directly.
+#
+# It refuses to start when the NoIR tuning file is missing, rather than coming
+# up silently on the IR-cut pipeline -- which costs ~0.14 Otsu separability on
+# every frame and produces no error at all. It also sets the environment
+# variable before exec'ing python, which is the only reliable way: libcamera
+# resolves the tuning path early enough that an os.environ assignment inside
+# Python loses the race, verified on this Pi.
+#
+# The script exec's, so systemd tracks the real python process rather than a
+# shell wrapper.
+ExecStart=/home/paul/pi-tower/run_camera_service.sh
+
+Restart=always
+RestartSec=5
+
+# The camera can wedge on a Pi 3. A restart is the only recovery, and a table
+# left running unattended needs that to happen without someone noticing first.
+TimeoutStopSec=20
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
