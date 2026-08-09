@@ -48,6 +48,38 @@ boot, and 217 MB free ninety seconds later. The first boot crashed with
 backoff instead — 62 s, zero restarts. Reserving more CMA would permanently
 cost a 1 GB Pi general-purpose RAM to fix a problem that lasts a minute.
 
+## Focus (Camera Module 3 only)
+
+The V2 was fixed-focus. The CM3 has a voice-coil lens that defaults to
+**continuous** autofocus, which is wrong here in a way that does not announce
+itself: it re-hunts whenever the dice change, so two captures of the same tray
+are focused differently. That breaks comparability between rolls, and it would
+quietly destroy the template matching in `docs/geometric-face-reading.md`,
+which assumes a fixed optical path. The camera and tray never move, so focus is
+a constant — find it once, pin it, persist it.
+
+`POST /autofocus` sweeps lens position and keeps the sharpest, measured **on
+the tray**, then pins it. `POST /focus {"lens_position": 4.1}` sets it directly
+(dioptres, i.e. 1/metres). `{"mode": "hardware"}` uses the sensor's own AF.
+
+**Why not just use the sensor's autofocus.** Same reason `/autoexpose` meters
+the dice rather than the frame: the hardware optimises for a subject it chooses
+itself. Measured, its AF cycle settled on 6.79 dioptres (~0.15 m) for a tray
+that was ~0.24 m away — plausible-looking, and soft where it mattered. The
+sweep found 4.09 and took central sharpness from **3.5 to 109.7**.
+
+**Measure sharpness on real frames, not on a timer.** The first sweep waited a
+fixed 0.35 s after each lens move. At 4608x2592 on a Pi 3 the grabber turns
+over slower than that, so samples were contaminated by the previous position:
+the peak beat its neighbours by 5%, inside the noise, and the same position
+measured twice as sharp once genuinely settled. It now counts two whole frames
+after the lens reports arrival. The margin went to 32%, and the answer moved a
+step — the bug had been choosing the wrong position, not merely reporting it
+imprecisely.
+
+`sharpness_at_pin` is recorded so drift is detectable, rather than discovered by
+eye on a blurry capture.
+
 ## Exposure: auto, locked, or manual
 
 Four buttons on the Mount tab.

@@ -37,7 +37,7 @@ Endpoints:
     POST /exposure                set exposure / gain / white balance by hand
     POST /autoexpose              meter the DICE, not the tray, then lock
     GET  /focus   POST /focus     read / pin the lens (Camera Module 3)
-    POST /autofocus               one AF sweep on the tray, then pin it
+    POST /autofocus               sharpness sweep over the tray, then pin it
     GET  /file/<name>             serve a produced image
 """
 
@@ -336,9 +336,11 @@ class Camera:
         self.lock = threading.Lock()
         self.latest_main = None
         self.latest_lores = None
+        self.frame_seq = 0
         self.meta = {}
         self.locked = False
         self.focus_pinned = None
+        self.focus_sharpness = None
         self.mode = None                   # None | "auto-lock" | "manual"
         self.locked_controls = {}
         self.lock_lux = None
@@ -373,24 +375,113 @@ class Camera:
                 "lens_position": round(float(pos), 3) if pos is not None else None,
                 "focus_distance_m": (round(1.0 / float(pos), 3)
                                      if pos else None),
-                "min": lo, "max": hi, "pinned": self.focus_pinned}
+                "min": lo, "max": hi, "pinned": self.focus_pinned,
+                "sharpness_at_pin": (round(self.focus_sharpness, 1)
+                                     if self.focus_sharpness else None),
+                "sharpness_now": (round(self._sharpness(), 1)
+                                  if self.latest_main is not None else None)}
 
     def set_focus(self, lens_position):
         """Pin the lens. LensPosition is in DIOPTRES: 1/distance_in_metres."""
         lo, hi, _ = self.picam2.camera_controls.get("LensPosition", (0.0, 10.0, 0.0))
         p = max(lo, min(hi, float(lens_position)))
         self.picam2.set_controls({"AfMode": 0, "LensPosition": p})   # 0 = Manual
-        time.sleep(0.6)
+        self._await_lens(p)
         self.focus_pinned = p
+        self.focus_sharpness = self._sharpness()
         self._persist()
         return self.focus_state()
+
+    # Window used to judge focus: full resolution, centred on the tray. Full
+    # resolution matters -- focus lives in the highest spatial frequencies, and
+    # measuring on the downscaled preview would flatten the very peak being
+    # searched for.
+    FOCUS_WIN = 1200
+
+    def _sharpness(self, box=None):
+        """Variance of the Laplacian over a full-res window on the tray."""
+        with self.lock:
+            if self.latest_main is None:
+                return None
+            H, W = self.latest_main.shape[:2]
+            if box:
+                cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
+            else:
+                cx, cy = W // 2, H // 2
+            half = self.FOCUS_WIN // 2
+            x0, y0 = max(0, cx - half), max(0, cy - half)
+            x1, y1 = min(W, cx + half), min(H, cy + half)
+            crop = self.latest_main[y0:y1, x0:x1, 1].copy()   # green: sharpest channel
+        return float(cv2.Laplacian(crop, cv2.CV_64F).var())
+
+    def _wait_frames(self, n=2, timeout=6.0):
+        """Block until n whole frames have been grabbed since now."""
+        with self.lock:
+            start = self.frame_seq
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.lock:
+                if self.frame_seq - start >= n:
+                    return True
+            time.sleep(0.02)
+        return False
+
+    def _await_lens(self, want, timeout=3.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.lock:
+                now = dict(self.meta).get("LensPosition")
+            if now is not None and abs(float(now) - want) < 0.05:
+                break
+            time.sleep(0.03)
+        # Two whole frames AFTER the lens reports arrival: one may already have
+        # been mid-exposure while the lens was still moving.
+        self._wait_frames(2)
+
+    def focus_sweep(self, box=None):
+        """Find the lens position that maximises sharpness ON THE TRAY, and pin it.
+
+        Preferred over the sensor's own autofocus for the same reason
+        highlight-priority metering is preferred over auto-exposure: the
+        hardware optimises for a subject it chooses, and it does not know the
+        subject is the dice. Measured, the AF cycle settled on 6.79 dioptres
+        (~0.15 m) when the tray was ~0.21 m away -- plausible-looking, and soft
+        where it mattered.
+
+        Sharpness against lens position has a single peak, so a coarse sweep to
+        bracket it followed by a fine sweep around the winner is enough, and is
+        far more robust to a weak target than a hill-climb.
+        """
+        lo, hi, _ = self.picam2.camera_controls.get("LensPosition", (0.0, 15.0, 0.0))
+        self.picam2.set_controls({"AfMode": 0})            # manual; we drive it
+        trace, seen = [], {}
+
+        def probe(p):
+            p = round(max(lo, min(hi, p)), 3)
+            if p in seen:                    # each position costs a lens move
+                return seen[p]
+            self.picam2.set_controls({"LensPosition": p})
+            self._await_lens(p)
+            v = self._sharpness(box)
+            v = -1.0 if v is None else v
+            seen[p] = v
+            trace.append({"lens_position": p, "sharpness": round(v, 1)})
+            return v
+
+        step = (hi - lo) / 11.0
+        best = max([lo + step * i for i in range(12)], key=probe)
+        fine = [best + step * k / 3.0 for k in (-2, -1, 1, 2)]
+        best = max([best] + [f for f in fine if lo <= f <= hi], key=probe)
+
+        st = self.set_focus(best)
+        st["sharpness"] = self.focus_sharpness
+        st["trace"] = sorted(trace, key=lambda t: t["lens_position"])
+        return st
 
     def autofocus(self):
         """Run one AF sweep, then pin whatever it found.
 
-        Deliberately a one-shot followed by a pin, never continuous. A tray of
-        dark dice on a dark floor is a weak AF target, so leaving it hunting
-        would mean occasionally refocusing on the tray wall between rolls.
+        Kept as the hardware path; focus_sweep() is the better default here.
         """
         if not self.has_focus():
             return {"supported": False}
@@ -498,6 +589,7 @@ class Camera:
                     self.latest_main = main
                     self.latest_lores = lores
                     self.meta = meta
+                    self.frame_seq += 1
             except Exception as e:                     # keep the thread alive
                 print(f"[camera] frame error: {e}", flush=True)
                 time.sleep(0.5)
@@ -845,6 +937,7 @@ class Camera:
             os.makedirs(os.path.dirname(EXPOSURE), exist_ok=True)
             json.dump({"controls": self.locked_controls, "lux": self.lock_lux,
                        "mode": self.mode, "focus": self.focus_pinned,
+                       "focus_sharpness": self.focus_sharpness,
                        # Stamped so a saved state is never applied to a
                        # different sensor -- gain ranges, tuning and lens are
                        # all sensor-specific, and silently restoring a V2 lock
@@ -1187,13 +1280,35 @@ def put_focus():
 
 @app.post("/autofocus")
 def do_autofocus():
-    """One AF sweep on the tray, then pin it. Never left on continuous."""
+    """Focus on the DICE, then pin. {"mode": "hardware"} for the sensor's own AF.
+
+    Default is a sharpness sweep over the tray rather than the sensor's
+    autofocus, for the same reason /autoexpose meters the dice rather than the
+    frame: the hardware optimises for a subject it picks itself. Measured, its
+    AF cycle chose 6.79 dioptres for a tray that was not at that distance, and
+    the captures were soft.
+    """
     if cam is None:
         return _no_camera()
     if not cam.has_focus():
         return jsonify({"error": "this camera has no motorised lens"}), 400
-    r = cam.autofocus()
-    return (jsonify(r), 500) if r.get("error") else jsonify(r)
+    body = request.get_json(silent=True) or {}
+    if body.get("mode") == "hardware":
+        r = cam.autofocus()
+        return (jsonify(r), 500) if r.get("error") else jsonify(r)
+    # Focus where the tray is, if we know; otherwise the middle of the frame,
+    # which is where it is anyway on this mount.
+    box = None
+    quad, qframe = load_quad()
+    if quad is not None:
+        try:
+            q, _ = fit_quad_to_frame(quad, qframe or list(cam.main_size),
+                                     (cam.main_size[1], cam.main_size[0]))
+            xs, ys = q[:, 0], q[:, 1]
+            box = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+        except ValueError:
+            box = None          # calibration is for another frame size
+    return jsonify(cam.focus_sweep(box=box))
 
 
 @app.get("/exposure")
