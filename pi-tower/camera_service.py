@@ -858,7 +858,7 @@ class Camera:
                 float(np.median(y)),
                 100.0 * float(np.mean(y >= 254)))
 
-    def autoexpose(self, box=None, gain=None):
+    def autoexpose(self, box=None, gain=None, _retry=False):
         """Brightest exposure that keeps the dice faces unsaturated, then lock.
 
         Bisection rather than arithmetic: output brightness is NOT linear in
@@ -867,7 +867,6 @@ class Camera:
         """
         lo, hi = 200, int(min(self.MAX_FRAME_US,
                               self.picam2.camera_controls["ExposureTime"][1]))
-        ceiling = hi
         gain = float(self.HL_GAIN if gain is None else gain)
 
         # Let white balance converge while the exposure search runs, then freeze
@@ -923,9 +922,37 @@ class Camera:
                          "the analogue gain or the lighting, then re-run.")
         else:
             at_best = [t for t in trace if t["exposure_us"] == best]
-            if best >= ceiling - 1 and at_best and at_best[0]["dice_top"] < self.HL_TARGET - 25:
-                notes.append("Hit the longest usable exposure and the dice are "
-                             "still dim. Add light or raise the analogue gain.")
+            got = at_best[0]["dice_top"] if at_best else self.HL_TARGET
+            # Test the OUTCOME, not where the search happened to stop.
+            # Requiring best >= ceiling-1 never fired: bisection converges
+            # near the ceiling, not exactly on it (1937228 of 2000000), so a
+            # tray that reached only 146 of 245 was accepted as final.
+            # Falling short of the target at all means brightness ran out.
+            if got < self.HL_TARGET - 15:
+                # Out of exposure, not out of options. The ceiling exists to
+                # keep the preview usable, not because longer is better --
+                # measured on this rig, exposure time and analogue gain are
+                # interchangeable, with identical noise and clipping. So trade
+                # into gain rather than handing back an underexposed frame.
+                #
+                # This is what a dim room actually looks like: metering a tray
+                # lit only by desk LEDs ran to the full 2 s ceiling at gain 1.0
+                # and still reached only about half the target brightness.
+                gmax = self.picam2.camera_controls.get(
+                    "AnalogueGain", (1.0, 8.0, 1.0))[1]
+                want = gain * (self.HL_TARGET / max(1.0, got))
+                new_gain = min(gmax, want)
+                if new_gain > gain * 1.05 and not _retry:
+                    notes.append(
+                        f"Exposure ran out at {best/1000:.0f} ms and the dice "
+                        f"only reached {got:.0f} of {self.HL_TARGET}. Raising "
+                        f"gain {gain:.2f}x -> {new_gain:.2f}x and re-metering.")
+                    r, more = self.autoexpose(box=box, gain=new_gain, _retry=True)
+                    return r, (notes + more) if r else notes + more
+                notes.append(
+                    f"At maximum exposure AND gain {gain:.2f}x the dice reach "
+                    f"only {got:.0f} of {self.HL_TARGET}. The scene is too dark "
+                    f"to expose properly -- add light.")
 
         applied, more = self.set_manual(exposure_us=best, analogue_gain=gain)
         self.mode = "auto-highlight"
