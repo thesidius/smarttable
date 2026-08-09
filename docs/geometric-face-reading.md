@@ -233,7 +233,36 @@ construction, because the calibration square was solved FROM it. The
 independent evidence is that the other seven come out die-sized, plus the 5%
 cross-check above.
 
-### Silhouette shape does NOT give die type
+### CORRECTION (same day): the negative result below was a bug
+
+The section that follows concluded silhouette shape cannot distinguish a d12
+from a d20. **It is wrong.** The forward model was standing every die on a
+CORNER, not a face: face normals were taken as the first vertex of the dual
+solid, and the two standard vertex constructions are duals only up to a
+rotation, so that direction pointed at a vertex. Support count 1 where a d20
+face needs 3.
+
+Re-run with the model fixed, on the same frame:
+
+| | with the bug | fixed |
+|---|---|---|
+| type classification | 2 of 8 | **6 of 7** |
+| calibration square implied by the caliper | 76.4 mm | **93.0 mm** |
+| camera height | 155 mm | 188 mm |
+
+Both conclusions drawn from it were therefore wrong. Silhouette shape **does**
+discriminate d12 from d20 -- the anchor d20 now scores IoU 0.970 as a d20
+against 0.921 as a d12, a real margin rather than the 0.004 seen before. And
+the tray calibration is not misplaced: 93.0 mm against a measured 95.0 mm flat
+floor is 2% agreement, so the clicked quad was right all along and the 20%
+discrepancy was this bug.
+
+Kept below rather than deleted, because the wrong conclusion was confidently
+argued from a plausible mechanism, and the lesson is that a geometric forward
+model needs its own sanity check -- a die that stands on a corner produces a
+perfectly reasonable-looking silhouette.
+
+### (superseded) Silhouette shape does NOT give die type
 
 Worth stating plainly because it is tempting and it does not work. Fitting both
 an icosahedron and a dodecahedron to each silhouette, solving inradius from
