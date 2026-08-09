@@ -201,6 +201,67 @@ cross-lighting figure for it is still unmeasured, and needs a real template set
 to measure. Re-run this test at the end of Phase 4 against the 20 clustered
 templates before trusting one set across conditions.
 
+## 2c — Scale, and a negative result on die type (2026-08-08)
+
+### The projection model is anchored
+
+Camera pose recovered by solvePnP from the tray-floor square, then scale
+anchored on one caliper measurement (a d20 at 25.8 mm across opposite faces).
+Two independent routes agree on the calibration square to within 5% -- the
+caliper chain says 76.4 mm, and the pixel ratio against the previously measured
+115 mm wall square says 80.4 mm. Camera sits ~155 mm above the floor, tilted
+19.9 deg.
+
+Note the clicked square was believed to be the 95 mm flat floor. Both routes
+say it is nearer 76-80 mm, so either the click was inside the true boundary or
+the 95 mm is of something else. Unresolved; the numbers below use 76.4 mm.
+
+### Die size comes off the image
+
+With the pose anchored, fitting a polyhedron of unknown inradius to the
+observed silhouette recovers real die sizes. Eight dice in one frame:
+
+    18.7, 19.2, 19.2, 19.6, 19.7, 20.1, 24.8, 25.8 mm across opposite faces
+
+Plausible throughout, and the yaw a die landed at changes silhouette area by
+only +/-0.2%, so no per-roll correction is needed. This weakens §8's
+per-die-set calibration limit: r does not have to be measured by hand for
+every new die.
+
+Careful with the anchor die though -- its 25.8 mm agrees with the caliper by
+construction, because the calibration square was solved FROM it. The
+independent evidence is that the other seven come out die-sized, plus the 5%
+cross-check above.
+
+### Silhouette shape does NOT give die type
+
+Worth stating plainly because it is tempting and it does not work. Fitting both
+an icosahedron and a dodecahedron to each silhouette, solving inradius from
+area and then optimising yaw for best IoU:
+
+| | d20 IoU | d12 IoU | margin |
+|---|---|---|---|
+| best case | 0.944 | 0.940 | 0.004 |
+| typical | 0.93 | 0.93 | <0.02 |
+
+Both models fit nearly every die about equally well, and the classification is
+right roughly 2 of 8 -- no better than guessing. The anchor d20, known from
+calipers and from the numerals on it, is called a d12 on a margin of 0.004.
+
+The reason is geometric: at a 20 deg viewing angle both solids present a
+near-circular convex hull, and the convex hull throws away exactly the facet
+structure that distinguishes them. This is the same wall §1 hit with
+circularity, reached by a much more thorough route -- full silhouette fitting
+under a known pose is about as far as outline matching can be pushed, and it
+is not enough.
+
+**So die type must come from the numerals, not the outline.** The cheapest
+route that fits this method: do not classify separately at all. Match each crop
+against the union of every type's templates and let the winning template imply
+both the type and the value. The measured cross-face correlations (0.08-0.21)
+suggest there is room for that, and it removes a whole stage. Size remains a
+weak prior -- useful for ordering candidates, not for deciding.
+
 ## 3 — Speed
 
 Measured, single CPU core, all 20 templates correlated in one batched FFT:
