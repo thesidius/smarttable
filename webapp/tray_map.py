@@ -133,3 +133,69 @@ class TrayMap:
             "px_per_mm_near_edge": [round(v, 2) for v in self.px_per_mm_at(near)],
             "px_per_mm_far_edge": [round(v, 2) for v in self.px_per_mm_at(far)],
         }
+
+
+# --------------------------------------------------------------- camera pose ---
+#
+# A homography maps ONE plane. The dice do not live on one plane: a die's body
+# centroid sits at the inradius above the floor and its top face at twice that,
+# which is the entire basis of docs/geometric-face-reading.md. Predicting where
+# the top face lands therefore needs the camera pose, not just a homography.
+#
+# Recovered from the calibration quad, which is a square of known size, via
+# solvePnP. Two cautions learned by doing it:
+#
+#   * WINDING decides the sign. The first attempt put the camera 136 mm BELOW
+#     the tray floor, because the object points were listed in the winding
+#     opposite to the image points.
+#
+#   * The residual does not go to zero and that is expected. Swept across focal
+#     lengths from 1200 to 9000 px the best reprojection error was 19.4 px --
+#     irreducible, so the four clicked points are not exactly a square under any
+#     pinhole model. On a 4608 px frame that is 0.4%, consistent with clicking
+#     on a scaled-down preview, where one displayed pixel is ~6 real ones.
+#     Treat a residual of this order as click precision; a much larger one means
+#     the quad is not the square you think it is.
+
+IMX708_F_PX = 3625.0     # self-calibrated from the square constraint; the
+                         # datasheet-derived guesses were 3386 and 3547
+
+
+def solve_pose(quad, square_mm, frame_size, f_px=IMX708_F_PX, quad_height_mm=0.0):
+    """Camera pose from a square of known size. Returns a dict, or None.
+
+    quad_height_mm lifts the calibration square above the floor -- the tray's
+    45 degree skirt means the clicked corners may not be on the plane the dice
+    rest on, and that offset propagates straight into every predicted position.
+    """
+    if cv2 is None:
+        raise RuntimeError("tray_map needs OpenCV")
+    q = order_quad(quad).astype(np.float64)
+    W, H = frame_size
+    h = float(square_mm) / 2.0
+    # Reversed winding: image order is clockwise seen from the camera.
+    obj = np.array([[-h, -h, 0.0], [h, -h, 0.0], [h, h, 0.0], [-h, h, 0.0]],
+                   np.float64)[::-1].copy()
+    K = np.array([[f_px, 0, W / 2.0], [0, f_px, H / 2.0], [0, 0, 1]], np.float64)
+    ok, rvec, tvec = cv2.solvePnP(obj, q, K, None, flags=cv2.SOLVEPNP_IPPE)
+    if not ok:
+        return None
+    R, _ = cv2.Rodrigues(rvec)
+    cam = (-R.T @ tvec).ravel()
+    proj, _ = cv2.projectPoints(obj, rvec, tvec, K, None)
+    return {
+        "rvec": rvec, "tvec": tvec, "K": K,
+        "camera_mm": [float(cam[0]), float(cam[1]),
+                      float(cam[2]) + float(quad_height_mm)],
+        "height_mm": float(cam[2]) + float(quad_height_mm),
+        "tilt_deg": float(np.degrees(np.arccos(
+            abs(float((R.T @ np.array([0, 0, 1.0]))[2]))))),
+        "reproj_px": float(np.linalg.norm(proj.reshape(-1, 2) - q, axis=1).mean()),
+    }
+
+
+def project(pose, pts_mm):
+    """Tray-space millimetres (x, y, z above the floor) -> image pixels."""
+    p = np.asarray(pts_mm, np.float64).reshape(-1, 3)
+    out, _ = cv2.projectPoints(p, pose["rvec"], pose["tvec"], pose["K"], None)
+    return out.reshape(-1, 2)
