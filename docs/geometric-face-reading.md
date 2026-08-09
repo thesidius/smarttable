@@ -291,6 +291,54 @@ both the type and the value. The measured cross-face correlations (0.08-0.21)
 suggest there is room for that, and it removes a whole stage. Size remains a
 weak prior -- useful for ordering candidates, not for deciding.
 
+## 2d — PHASE 2 GATE: PASSED (2026-08-08)
+
+The build order's gate: *verify the predicted top-face centre lands inside the
+correct face. Nothing else works if this doesn't.*
+
+**8 of 8 land on the correct top face**, judged by eye against the numerals.
+
+Done with the full forward model rather than §1's approximation. §1 predicts
+`centroid + r . projected_up_vector`; with the camera pose recovered there is
+no need to approximate -- fit the die's (x, y, inradius, yaw) by maximising
+silhouette IoU, then read the top-face centre straight off the fitted solid.
+
+| id | type | IoU | margin over the other type | 2r mm | correction px |
+|---|---|---|---|---|---|
+| 1 | d20 | 0.965 | +0.049 | 19.6 | 94 |
+| 3 | d12 | 0.965 | +0.038 | 24.0 | 105 |
+| 4 | d20 | 0.962 | +0.039 | 20.1 | 81 |
+| 5 | d20 | 0.970 | +0.048 | 25.8 | 100 |
+| 6 | d12 | 0.942 | +0.023 | 17.5 | 63 |
+| 8 | d12 | 0.965 | +0.027 | 18.6 | 63 |
+| 9 | d20 | 0.949 | +0.005 | 19.5 | 44 |
+| 10 | d12 | 0.967 | +0.027 | 18.1 | 49 |
+
+Three things worth pulling out.
+
+**The correction is doing real work.** Median 72 px between the silhouette
+centroid and the predicted top-face centre -- around a third of a die. §1's
+warning holds: ignoring it lands you on the wrong face. In the rendered check
+the centroid sits consistently offset from the predicted centre in the
+direction away from the camera nadir, which is the direction the geometry says
+it should.
+
+**Die type came out 8 of 8**, by fitting position as well as size and yaw. It
+was 6 of 7 fitting size and yaw alone. Type from geometry now looks solid --
+though this is the third answer this problem has given today, so it wants
+independent confirmation before being relied on.
+
+**Die 9 is the thin one.** Its margin over the wrong type is +0.005, against
++0.023 or better for everything else. It is also the die with the smallest
+correction, at 44 px. Worth watching as the case that breaks first.
+
+### What this does not establish
+
+Eight dice, one frame, one lighting condition, all resting cleanly. The build
+order asked for 20. Cocked dice, dice touching, and dice against the tray wall
+are all untested, and §8 expects the derivation to fail on them -- detecting
+that failure is §7's job and is not built yet.
+
 ## 3 — Speed
 
 Measured, single CPU core, all 20 templates correlated in one batched FFT:
