@@ -109,7 +109,15 @@ except ImportError:
 # silhouette -- it buys accuracy in the model, which is where reading happens.
 #
 # The preview is unaffected by any of this; it comes off lores.
-LORES_SIZE = (640, 480)
+#
+# Only the WIDTH is fixed. The height is derived from the main stream's aspect
+# ratio at open time, because lores shows the same field of view through a
+# separate scaler: hardcoding 640x480 against a 16:9 sensor does not crop, it
+# ANAMORPHICALLY SQUASHES -- the Camera Module 3 preview came out visibly
+# narrowed horizontally while the captures were correct. 640x480 was right for
+# the 4:3 V2 and silently wrong for everything else, which is the reason this
+# is now computed rather than written down.
+LORES_W = 640
 CONFIG = os.path.expanduser("~/.config/dicecam/tray.json")
 EXPOSURE = os.path.expanduser("~/.config/dicecam/exposure.json")
 
@@ -228,6 +236,13 @@ class Camera:
     BUFFER_COUNT = 3
 
     @staticmethod
+    def _lores_for(main_size):
+        """Preview size matching the main stream's aspect. Even height for YUV420."""
+        mw, mh = main_size
+        h = int(round(LORES_W * mh / float(mw)))
+        return (LORES_W, h - (h % 2))
+
+    @staticmethod
     def detect():
         """(sensor_model, tuning_path, size_ladder) before opening anything.
 
@@ -267,12 +282,13 @@ class Camera:
         for attempt in range(1, self.OPEN_ATTEMPTS + 1):
             for size in sizes:
                 picam2 = None
+                lores = self._lores_for(size)
                 try:
                     # tuning= is the only mechanism that works; see SENSORS.
                     picam2 = Picamera2(tuning=tuning)
                     picam2.configure(picam2.create_video_configuration(
                         main={"size": tuple(size), "format": "RGB888"},
-                        lores={"size": LORES_SIZE, "format": "YUV420"},
+                        lores={"size": lores, "format": "YUV420"},
                         buffer_count=self.BUFFER_COUNT,
                         raw=None,        # the RAW stream is another full-size buffer
                     ))
@@ -285,7 +301,7 @@ class Camera:
                     # libcamera was actually given -- which is the thing the old
                     # env-var check only appeared to be checking.
                     return (picam2, os.environ.get("LIBCAMERA_RPI_TUNING_FILE"),
-                            tuple(size))
+                            tuple(size), lores)
                 except Exception as e:
                     last = e
                     try:
@@ -315,7 +331,8 @@ class Camera:
     def __init__(self):
         self.sensor = None
         self.tuning_expected = None
-        self.picam2, self.tuning_active, self.main_size = self._open()
+        (self.picam2, self.tuning_active, self.main_size,
+         self.lores_size) = self._open()
         self.lock = threading.Lock()
         self.latest_main = None
         self.latest_lores = None
@@ -738,7 +755,7 @@ class Camera:
             lores = None if self.latest_lores is None else self.latest_lores.copy()
         if lores is None:
             return None
-        w, h = LORES_SIZE
+        w, h = self.lores_size
         y = lores[:h, :w].astype(np.float32)      # I420: Y plane first
         if box:
             x0, y0, x1, y1 = box
@@ -1007,7 +1024,7 @@ def health():
         "sensor": cam.sensor,
         "main_size": list(cam.main_size),
         "focus": cam.focus_state(),
-        "lores_size": list(LORES_SIZE),
+        "lores_size": list(cam.lores_size),
         # cam.tuning_active is read back from picamera2 AFTER it opened the
         # camera, so it is the file libcamera was actually handed. The previous
         # version reported the environment variable we had set ourselves, which
@@ -1122,7 +1139,7 @@ def do_autoexpose():
         # meter the desk around the tray, which is exactly the mistake being
         # fixed -- and the desk here is a bright purple mat.
         try:
-            w, h = LORES_SIZE
+            w, h = cam.lores_size
             sx = w / float(qframe[0] if qframe else cam.main_size[0])
             sy = h / float(qframe[1] if qframe else cam.main_size[1])
             xs, ys = quad[:, 0] * sx, quad[:, 1] * sy
