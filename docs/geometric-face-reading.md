@@ -122,6 +122,85 @@ conversion weights a red channel that carries mostly noise.
 
 ---
 
+## 2b — Measured on the real rig (2026-08-08)
+
+Everything in this section was run against live captures from the current
+hardware (Camera Module 3, IMX708, 4608x2592). Where it contradicts the
+sections above, prefer this — §2's numbers predate the camera swap.
+
+### The 0.4 deg rotation figure is synthetic
+
+Reproduced digit for digit — 0.0, 0.1, 0.0, 0.1, 0.9, 0.8, 0.3, 0.9, MAE 0.39 —
+by taking one crop, rotating it with `warpAffine`, and recovering the angle.
+That measures an FFT round-trip, not a die that physically landed at a
+different angle, where the numerals rotate but the specular highlights do not.
+Sub-bin accuracy from a 2.8 deg grid is the tell: only possible when reference
+and test are the same pixels. **The method may be fine; that number is not
+evidence for it.** Rotation recovery on physically re-rolled dice is still
+unmeasured.
+
+### Match on GRADIENT MAGNITUDE, not intensity
+
+Rotation-invariant correlation between *different* faces (self = 1.000, lower
+is better):
+
+| representation | white light | blue LED light |
+|---|---|---|
+| naive `BGR2GRAY` | 0.475 | 0.205 |
+| CLAHE'd intensity (what §2 does) | 0.245 | 0.250 |
+| **gradient magnitude** | **0.127** | **0.189** |
+
+A gradient discards the additive term (ambient level); normalising discards the
+multiplicative one (brightness, gain). Between them that is most of what
+changing the light does.
+
+### The channel is a per-capture measurement, not green
+
+§2 says green. Measured best channel was **blue** under white light and
+**green** under blue LEDs — the opposite of the naive guess both times, because
+what matters is where numeral-vs-body contrast survives, not where the
+illuminant is bright. Pick it per capture by detail energy on the die pixels.
+(§2's "40-80% more detail than BGR2GRAY" also understates it: measured
++216% to +358%.)
+
+### Cross-lighting: one template set survives a 27x change in light
+
+The test that matters for §4, run with the dice untouched between captures so
+crops could be paired by position (max drift 6 px):
+
+| | A | B |
+|---|---|---|
+| illuminance | 1.6 lux | 43.1 lux |
+| colour (mean B/G/R) | 84.6 / 26.2 / 41.8 | 43.8 / 46.5 / 49.2 |
+| exposure chosen | 1992 ms @ 1.6x | 117 ms @ 1.12x |
+| best channel chosen | green | blue |
+
+| representation | same face across light | different face | correct nearest-match |
+|---|---|---|---|
+| CLAHE'd intensity | mean 0.338, worst 0.104 | mean 0.118, best 0.245 | 8/10 |
+| **gradient magnitude** | mean 0.335, worst 0.147 | mean 0.080, best 0.168 | **10/10** |
+
+**Templates do not have to be re-derived when the light changes.** Note the
+channel selection differed between the two captures and matching still held.
+
+### Therefore: nearest-neighbour, never an absolute threshold
+
+Worst same-face (0.147) sits BELOW best different-face (0.168). There is no
+global cut that separates them — yet every die still matched itself better than
+any other, because the comparison that matters is within one query. So §7's
+"threshold on peak correlation" is unusable and should be dropped; only its
+second half survives, the **margin between best and second-best**.
+
+### What this does NOT show
+
+These ten crops were ten *different dice* — different colours, sizes and types.
+Telling a black d20 from a white d12 is much easier than telling face 7 of a
+d20 from face 13 of the same die, which is the actual task. The same-lighting
+figure for that harder case is 0.08-0.21 (§2b above, real d20 crops); the
+cross-lighting figure for it is still unmeasured, and needs a real template set
+to measure. Re-run this test at the end of Phase 4 against the 20 clustered
+templates before trusting one set across conditions.
+
 ## 3 — Speed
 
 Measured, single CPU core, all 20 templates correlated in one batched FFT:
@@ -309,9 +388,22 @@ On a typical roll that removes most dice from the expensive path.
 
 ## 10 — Build order
 
-1. **Top-face localisation** against existing `test-data` frames. Verify the
-   predicted centre lands inside the correct face by eye on 20 dice. Nothing
-   else works if this doesn't.
+0. **Prerequisites the camera swap created.** `test-data/` is from the previous
+   camera at a different height under different light and cannot validate this
+   rig. §1's offset table was computed for 8.14 in / 21.3 deg with the V2 lens
+   and is now doubly stale, so the up-vector field must be **measured, not
+   derived**: place a die at several known tray positions, mark the true
+   top-face centre, fit the offset field. That also absorbs lens distortion and
+   mount error, which the nominal numbers never carried.
+   `seg_service` returns bbox and area but **no mask centroid** — the input this
+   whole method starts from. Add it first.
+
+1. **Top-face localisation** on fresh captures. Verify the predicted centre
+   lands inside the correct face by eye on 20 dice. Nothing else works if this
+   doesn't. Expect the silhouette centroid to be a biased estimate of the
+   projected body centroid — the silhouette includes side faces, and which ones
+   depends on the die's yaw, so the bias varies per roll. Measure it per die
+   type rather than assuming it away.
 2. **Log-polar + FFT rotation recovery.** Already validated at 0.4° here;
    confirm on your own crops.
 3. **Template capture and clustering** for one d20. Check cluster balance
