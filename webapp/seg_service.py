@@ -10,7 +10,14 @@ otherwise reload on every roll.
     .venv-ml\\Scripts\\python.exe webapp\\seg_service.py
 
 POST /segment  {"image": "<base64 png/jpg>"}
-  -> {"count": N, "dice": [{"bbox", "area", "crop": "<base64 png>"}], "seconds"}
+  -> {"count": N, "seconds",
+      "dice": [{"bbox", "area", "centroid", "contour",
+                "crop_origin", "crop_side", "crop": "<base64 png>"}]}
+
+centroid/contour/crop_origin/crop_side are all in FRAME coordinates, for
+docs/geometric-face-reading.md: it predicts the top face from the silhouette
+centroid rather than searching for it, and needs to map that prediction back
+into the crop.
 
 Each returned crop is the die COMPOSITED ONTO NEUTRAL GREY using its mask, not
 a rectangular cut-out. That is the entire point of Phase 1: a bounding box
@@ -142,6 +149,41 @@ def _filter(masks, area, shape):
     return kept, rejected
 
 
+def _geometry(mask):
+    """Silhouette centroid and outline, in FRAME coordinates.
+
+    The centroid is where geometric face reading starts: a die resting on a
+    face has its top face centre directly above its body centroid by twice the
+    inradius, so the top face is predicted from this rather than searched for.
+    Image moments, not the bbox centre -- the bbox centre of an asymmetric
+    silhouette is not its centroid, and the whole prediction is an offset from
+    this point.
+
+    NOTE the centroid of the SILHOUETTE is only an estimate of the projected
+    body centroid: the silhouette includes whichever side faces happen to face
+    the camera, so the bias depends on the die's yaw and changes per roll. It
+    is the right starting point and it is not exact; measure the residual per
+    die type before building on it.
+
+    The outline is returned so a predicted point can be tested for containment
+    -- a predicted top-face centre outside the silhouette means the die is not
+    resting flat, which is one of the three cheap failure signals.
+    """
+    m = mask.astype(np.uint8)
+    mom = cv2.moments(m, binaryImage=True)
+    if mom["m00"] <= 0:
+        return None, None
+    centroid = [round(mom["m10"] / mom["m00"], 2), round(mom["m01"] / mom["m00"], 2)]
+    cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cs:
+        return centroid, None
+    c = max(cs, key=cv2.contourArea)
+    # Simplified: a die outline needs a handful of points, not thousands, and
+    # this travels over the wire on every roll.
+    eps = 0.004 * cv2.arcLength(c, True)
+    return centroid, cv2.approxPolyDP(c, eps, True).reshape(-1, 2).tolist()
+
+
 def _crop(rgb, mask):
     """One die on neutral grey, square, mask-composited.
 
@@ -173,7 +215,7 @@ def _crop(rgb, mask):
     """
     ys, xs = np.where(mask)
     if len(xs) == 0:
-        return None, None
+        return None, None, None, None
     x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
     cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
     side = int(max(x1 - x0, y1 - y0) * CROP_CONTEXT)
@@ -184,7 +226,7 @@ def _crop(rgb, mask):
     ax0, ay0 = max(0, sx), max(0, sy)
     ax1, ay1 = min(rgb.shape[1], sx + side), min(rgb.shape[0], sy + side)
     if ax1 <= ax0 or ay1 <= ay0:
-        return None, None
+        return None, None, None, None
     sub = rgb[ay0:ay1, ax0:ax1]
     sub_m = mask[ay0:ay1, ax0:ax1]
     dst = out[ay0 - sy:ay1 - sy, ax0 - sx:ax1 - sx]
@@ -192,7 +234,8 @@ def _crop(rgb, mask):
 
     buf = io.BytesIO()
     Image.fromarray(out).save(buf, format="PNG")
-    return buf.getvalue(), [int(x0), int(y0), int(x1 - x0), int(y1 - y0)]
+    return (buf.getvalue(), [int(x0), int(y0), int(x1 - x0), int(y1 - y0)],
+            [int(sx), int(sy)], int(side))
 
 
 # Well-separated hues, not random. A random palette produced two near-identical
@@ -276,10 +319,17 @@ def segment():
 
     dice = []
     for m in kept:
-        png, bbox = _crop(rgb, m)
+        png, bbox, origin, side = _crop(rgb, m)
         if png is None:
             continue
+        centroid, contour = _geometry(m)
         dice.append({"bbox": bbox, "area": int(m.sum()),
+                     # Frame coordinates. crop_origin is the crop window's
+                     # top-left IN THE FRAME (it can be negative where the
+                     # window overhangs the edge), so frame -> crop is a
+                     # subtraction and nothing downstream has to re-derive it.
+                     "centroid": centroid, "contour": contour,
+                     "crop_origin": origin, "crop_side": side,
                      "crop": base64.b64encode(png).decode()})
 
     # Top-left reading order, so ids are stable enough for a human to follow.
