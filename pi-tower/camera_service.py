@@ -15,12 +15,13 @@ picamera2 can reconfigure between video and still modes, but doing that live,
 per request, on a Pi 3 is slow and a reliable source of hangs. Instead the
 camera runs continuously in a video configuration with two streams:
 
-    main  3280x2464 RGB888  -- what /capture and /roll operate on
-    lores  640x480  YUV420  -- what the MJPEG preview serves
+    main  largest allocatable RGB888  -- what /capture and /roll operate on
+    lores  640x480 YUV420             -- what the MJPEG preview serves
 
 The ISP produces both from the same frame, so the preview costs almost nothing
-and never fights the capture path. See MAIN_SIZE below for why the main stream
-is the full sensor.
+and never fights the capture path. The main stream is the largest size the
+sensor offers that the Pi's contiguous memory will actually allocate -- see
+Camera.detect() and the SENSORS table.
 
 Endpoints:
     GET  /health                  service + camera state
@@ -35,6 +36,8 @@ Endpoints:
     GET  /exposure                current settings + the sensor's real ranges
     POST /exposure                set exposure / gain / white balance by hand
     POST /autoexpose              meter the DICE, not the tray, then lock
+    GET  /focus   POST /focus     read / pin the lens (Camera Module 3)
+    POST /autofocus               one AF sweep on the tray, then pin it
     GET  /file/<name>             serve a produced image
 """
 
@@ -66,8 +69,26 @@ import time
 #
 # Pass it through the supported API instead. picamera2 then sets the variable
 # itself, immediately before opening the camera, and leaves it set.
-NOIR_TUNING = "/usr/share/libcamera/ipa/rpi/vc4/imx219_noir.json"
-TUNING = NOIR_TUNING if os.path.exists(NOIR_TUNING) else None
+TUNING_DIR = "/usr/share/libcamera/ipa/rpi/vc4"
+
+# Per sensor: the tuning file, and the main-stream sizes to try LARGEST FIRST.
+#
+# imx219 is the Camera Module V2 NoIR, hence the _noir tuning -- without it
+# libcamera assumes an IR-cut filter that module does not have.
+#
+# imx708 is Camera Module 3. The STANDARD module has an IR-cut filter, so it
+# takes the plain tuning; imx708_noir.json and the _wide variants exist for the
+# other SKUs and the sensor reports the same id for all of them, so this cannot
+# be auto-detected -- override with DICECAM_TUNING if the module is swapped.
+#
+# Size ladder rather than one value because a Pi 3 may simply not have the
+# contiguous memory for the full sensor: 4608x2592 RGB888 is 35.8 MB per buffer.
+# Try for the resolution, fall back rather than refuse to start.
+SENSORS = {
+    "imx219": {"tuning": "imx219_noir.json", "sizes": [(3280, 2464)]},
+    "imx708": {"tuning": "imx708.json",      "sizes": [(4608, 2592), (2304, 1296)]},
+}
+DEFAULT_SENSOR = {"tuning": None, "sizes": [(2304, 1296), (1920, 1080)]}
 
 import cv2                                    # noqa: E402
 import numpy as np                            # noqa: E402
@@ -81,17 +102,13 @@ try:
 except ImportError:
     sys.exit("picamera2 missing -> sudo apt install -y python3-picamera2")
 
-# Full sensor. Measured: at 1640x1232 the reader typed d20s unstably; at
-# 3280x2464 it got 4/4 of them right, and the residual error became a
-# consistent d12->d10 confusion rather than noise. Circularity was unchanged,
-# so this buys nothing for the CV silhouette -- it buys accuracy in the model,
-# which is where reading actually happens.
+# Resolution is worth paying for, which is why the SENSORS ladder tries the
+# largest size first. Measured on the V2: at 1640x1232 the reader typed d20s
+# unstably; at 3280x2464 it got 4/4 right, and the residual error became a
+# consistent d12->d10 confusion rather than noise. It buys nothing for the CV
+# silhouette -- it buys accuracy in the model, which is where reading happens.
 #
-# Cost on a Pi 3: an RGB888 frame here is ~24 MB and the grabber holds a copy,
-# against 905 MB usable. Frame rate drops to single digits. Acceptable because
-# nothing in this pipeline needs a fast main stream -- the preview comes from
-# lores, which is unaffected.
-MAIN_SIZE = (3280, 2464)
+# The preview is unaffected by any of this; it comes off lores.
 LORES_SIZE = (640, 480)
 CONFIG = os.path.expanduser("~/.config/dicecam/tray.json")
 EXPOSURE = os.path.expanduser("~/.config/dicecam/exposure.json")
@@ -203,38 +220,92 @@ class Camera:
     OPEN_ATTEMPTS = 10
     OPEN_BACKOFF_S = 6
 
+    # Explicit, and small. picamera2 defaults a video configuration to 6 buffers,
+    # which at 4608x2592 RGB888 would ask CMA for 215 MB of the 256 MB it has --
+    # the single biggest reason full resolution would fail to allocate. Nothing
+    # here needs depth: the scene is stationary dice and the preview comes off
+    # the lores stream.
+    BUFFER_COUNT = 3
+
+    @staticmethod
+    def detect():
+        """(sensor_model, tuning_path, size_ladder) before opening anything.
+
+        global_camera_info() reads the sensor id without taking the camera, so
+        the configuration can be chosen for the hardware actually fitted rather
+        than hardcoded -- which is what turned a module swap into an afternoon.
+        """
+        try:
+            info = Picamera2.global_camera_info()
+        except Exception:
+            info = []
+        if not info:
+            raise RuntimeError("no camera detected by libcamera")
+        model = str(info[0].get("Model", "")).lower()
+        spec = SENSORS.get(model, DEFAULT_SENSOR)
+
+        override = os.environ.get("DICECAM_TUNING")
+        name = override or spec["tuning"]
+        path = None
+        if name:
+            path = name if os.path.isabs(name) else os.path.join(TUNING_DIR, name)
+            if not os.path.exists(path):
+                print(f"[camera] tuning {path} missing; using libcamera default",
+                      flush=True)
+                path = None
+        return model, path, list(spec["sizes"])
+
     def _open(self):
         """Open and configure the camera, waiting out transient CMA pressure.
 
-        Returns (picam2, tuning_actually_in_force).
+        Returns (picam2, tuning_actually_in_force, main_size).
         """
+        model, tuning, sizes = self.detect()
+        self.sensor = model
+        self.tuning_expected = tuning
         last = None
         for attempt in range(1, self.OPEN_ATTEMPTS + 1):
-            try:
-                # tuning= is the only mechanism that works; see NOIR_TUNING.
-                picam2 = Picamera2(tuning=TUNING)
-                picam2.configure(picam2.create_video_configuration(
-                    main={"size": MAIN_SIZE, "format": "RGB888"},
-                    lores={"size": LORES_SIZE, "format": "YUV420"},
-                ))
-                # Read it back AFTER construction, not before. picamera2 sets
-                # this itself when handed a tuning file and pops it when not, so
-                # post-construction it reports what libcamera was actually given
-                # -- which is the thing the old env-var check only appeared to
-                # be checking.
-                return picam2, os.environ.get("LIBCAMERA_RPI_TUNING_FILE")
-            except Exception as e:
-                last = e
-                if attempt == self.OPEN_ATTEMPTS:
-                    break
-                print(f"[camera] open attempt {attempt}/{self.OPEN_ATTEMPTS} failed "
-                      f"({e}); {_cma_free_mb():.0f} MB CMA free, retrying in "
-                      f"{self.OPEN_BACKOFF_S}s", flush=True)
+            for size in sizes:
+                picam2 = None
                 try:
-                    picam2.close()
-                except Exception:
-                    pass
-                time.sleep(self.OPEN_BACKOFF_S)
+                    # tuning= is the only mechanism that works; see SENSORS.
+                    picam2 = Picamera2(tuning=tuning)
+                    picam2.configure(picam2.create_video_configuration(
+                        main={"size": tuple(size), "format": "RGB888"},
+                        lores={"size": LORES_SIZE, "format": "YUV420"},
+                        buffer_count=self.BUFFER_COUNT,
+                        raw=None,        # the RAW stream is another full-size buffer
+                    ))
+                    if tuple(size) != tuple(sizes[0]):
+                        print(f"[camera] {sizes[0][0]}x{sizes[0][1]} would not "
+                              f"allocate; running at {size[0]}x{size[1]}", flush=True)
+                    # Read the tuning back AFTER construction, not before.
+                    # picamera2 sets this itself when handed a tuning file and
+                    # pops it when not, so post-construction it reports what
+                    # libcamera was actually given -- which is the thing the old
+                    # env-var check only appeared to be checking.
+                    return (picam2, os.environ.get("LIBCAMERA_RPI_TUNING_FILE"),
+                            tuple(size))
+                except Exception as e:
+                    last = e
+                    try:
+                        if picam2 is not None:
+                            picam2.close()
+                    except Exception:
+                        pass
+
+            # Every size failed. Retrying only helps if the failure is memory
+            # pressure, which clears as the desktop finishes booting. Anything
+            # else -- no camera on the bus, a bad cable -- will fail identically
+            # forever, and spending 60s discovering that delays the honest error.
+            if "allocate" not in str(last).lower():
+                raise RuntimeError(f"camera present but could not be configured: {last}")
+            if attempt == self.OPEN_ATTEMPTS:
+                break
+            print(f"[camera] open attempt {attempt}/{self.OPEN_ATTEMPTS} failed "
+                  f"({last}); {_cma_free_mb():.0f} MB CMA free, retrying in "
+                  f"{self.OPEN_BACKOFF_S}s", flush=True)
+            time.sleep(self.OPEN_BACKOFF_S)
         raise RuntimeError(
             f"could not open the camera after {self.OPEN_ATTEMPTS} attempts over "
             f"~{self.OPEN_ATTEMPTS * self.OPEN_BACKOFF_S}s: {last}. "
@@ -242,12 +313,15 @@ class Camera:
             f"took it, if it is large the camera itself is the problem.")
 
     def __init__(self):
-        self.picam2, self.tuning_active = self._open()
+        self.sensor = None
+        self.tuning_expected = None
+        self.picam2, self.tuning_active, self.main_size = self._open()
         self.lock = threading.Lock()
         self.latest_main = None
         self.latest_lores = None
         self.meta = {}
         self.locked = False
+        self.focus_pinned = None
         self.mode = None                   # None | "auto-lock" | "manual"
         self.locked_controls = {}
         self.lock_lux = None
@@ -256,6 +330,97 @@ class Camera:
         time.sleep(2)                      # let AE/AWB settle before first frame
         threading.Thread(target=self._loop, daemon=True).start()
         self._restore_lock()
+
+    # --- focus (Camera Module 3 and anything else with a motorised lens) -----
+    #
+    # The V2 was fixed-focus, so focus never existed as a concept here. The CM3
+    # has a voice-coil lens that defaults to CONTINUOUS autofocus, which is
+    # actively wrong for this rig: it will re-hunt whenever the dice change,
+    # so two captures of the same tray are focused differently. That breaks
+    # comparability, and it would quietly destroy the template matching in
+    # docs/geometric-face-reading.md, which assumes a fixed optical path.
+    #
+    # The camera and tray never move, so focus is a constant. Find it once, pin
+    # it, persist it -- the same shape as the exposure lock, for the same reason.
+    def has_focus(self):
+        return "AfMode" in self.picam2.camera_controls
+
+    def focus_state(self):
+        if not self.has_focus():
+            return {"supported": False}
+        with self.lock:
+            m = dict(self.meta)
+        lo, hi, _ = self.picam2.camera_controls.get("LensPosition", (0.0, 10.0, 0.0))
+        pos = m.get("LensPosition")
+        return {"supported": True,
+                "lens_position": round(float(pos), 3) if pos is not None else None,
+                "focus_distance_m": (round(1.0 / float(pos), 3)
+                                     if pos else None),
+                "min": lo, "max": hi, "pinned": self.focus_pinned}
+
+    def set_focus(self, lens_position):
+        """Pin the lens. LensPosition is in DIOPTRES: 1/distance_in_metres."""
+        lo, hi, _ = self.picam2.camera_controls.get("LensPosition", (0.0, 10.0, 0.0))
+        p = max(lo, min(hi, float(lens_position)))
+        self.picam2.set_controls({"AfMode": 0, "LensPosition": p})   # 0 = Manual
+        time.sleep(0.6)
+        self.focus_pinned = p
+        self._persist()
+        return self.focus_state()
+
+    def autofocus(self):
+        """Run one AF sweep, then pin whatever it found.
+
+        Deliberately a one-shot followed by a pin, never continuous. A tray of
+        dark dice on a dark floor is a weak AF target, so leaving it hunting
+        would mean occasionally refocusing on the tray wall between rolls.
+        """
+        if not self.has_focus():
+            return {"supported": False}
+        self.picam2.set_controls({"AfMode": 1})                      # 1 = Auto
+        try:
+            ok = self.picam2.autofocus_cycle()
+        except Exception as e:
+            return {"supported": True, "error": f"autofocus failed: {e}"}
+
+        # WAIT for the grabber's metadata to catch up before reading the result.
+        # autofocus_cycle() returns as soon as the sweep is done, but several
+        # frames are still in flight and self.meta still holds the PRE-focus
+        # lens position. Reading it immediately pinned the old value while
+        # reporting the new one -- the response said lens_position 6.545 and
+        # pinned 1.0, which is the same stale-read bug the exposure path has
+        # _await_controls for.
+        pos, stable = None, 0
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            with self.lock:
+                now = dict(self.meta).get("LensPosition")
+            if now is not None and pos is not None and abs(now - pos) < 1e-3:
+                stable += 1
+                if stable >= 3:
+                    break
+            else:
+                stable = 0
+            pos = now
+            time.sleep(0.1)
+        if pos is None:
+            return {"supported": True, "error": "no lens position reported"}
+        st = self.set_focus(pos)
+        st["converged"] = bool(ok)
+        return st
+
+    def _restore_focus(self, saved):
+        pos = saved.get("focus")
+        if pos is None or not self.has_focus():
+            return
+        try:
+            self.picam2.set_controls({"AfMode": 0, "LensPosition": float(pos)})
+            self.focus_pinned = float(pos)
+            dist = f" (~{1.0/float(pos):.2f} m)" if float(pos) else " (infinity)"
+            print(f"[camera] restored pinned focus: {pos} dioptres{dist}",
+                  flush=True)
+        except Exception as e:
+            print(f"[camera] could not restore focus: {e}", flush=True)
 
     def _restore_lock(self):
         """Re-apply the saved exposure lock on startup.
@@ -273,7 +438,21 @@ class Camera:
             return
         try:
             saved = json.load(open(EXPOSURE))
-            ctrl = dict(saved["controls"])
+            was = saved.get("sensor")
+            if was and self.sensor and was != self.sensor:
+                # Exposure values are meaningless across sensors: different
+                # gain range, different tuning, different lens. Applying them
+                # anyway would present as a badly broken camera rather than as
+                # a stale setting, so drop them and start clean.
+                print(f"[camera] discarding saved exposure: it was taken on "
+                      f"{was}, this is {self.sensor}. Run auto-expose again.",
+                      flush=True)
+                os.remove(EXPOSURE)
+                return
+            self._restore_focus(saved)
+            ctrl = dict(saved.get("controls") or {})
+            if not ctrl:
+                return            # focus-only save; there is no lock to restore
             if isinstance(ctrl.get("ColourGains"), list):
                 ctrl["ColourGains"] = tuple(ctrl["ColourGains"])
             time.sleep(1.0)                 # let the pipeline accept controls
@@ -648,7 +827,12 @@ class Camera:
         try:
             os.makedirs(os.path.dirname(EXPOSURE), exist_ok=True)
             json.dump({"controls": self.locked_controls, "lux": self.lock_lux,
-                       "mode": self.mode,
+                       "mode": self.mode, "focus": self.focus_pinned,
+                       # Stamped so a saved state is never applied to a
+                       # different sensor -- gain ranges, tuning and lens are
+                       # all sensor-specific, and silently restoring a V2 lock
+                       # onto a CM3 would look like a broken camera.
+                       "sensor": self.sensor,
                        "saved": time.strftime("%Y-%m-%dT%H:%M:%S")},
                       open(EXPOSURE, "w"), indent=2)
         except OSError as e:
@@ -695,7 +879,56 @@ class Camera:
         return self.locked_controls
 
 
-cam = Camera()
+def _camera_fault_hint():
+    """Turn a failed camera open into something actionable.
+
+    The kernel already knows why, and says so precisely -- but in dmesg, which
+    is not where anyone looks when a web UI says the Pi is down.
+    """
+    try:
+        import subprocess
+        out = subprocess.run(["dmesg"], capture_output=True, text=True,
+                             timeout=5).stdout
+    except Exception:
+        return ("Could not read dmesg. Check the ribbon cable and run "
+                "'rpicam-hello --list-cameras' on the Pi.")
+    probe = [l for l in out.splitlines()
+             if "failed to read chip id" in l or "probe with driver" in l]
+    if probe:
+        return ("The sensor driver loaded but got no answer over I2C -- "
+                "error -5 is EIO, meaning nothing is responding on the camera "
+                "bus. This is a cable or connector fault, not software: "
+                "reseat the ribbon at BOTH ends, check it is the right way "
+                "round, and power-cycle. Kernel said: " + probe[-1].strip())
+    if "imx" not in out and "unicam" not in out:
+        return ("No camera was detected at boot. CSI cameras are probed by "
+                "firmware at boot, so a camera connected while running will "
+                "not appear -- reboot. If it still does not appear, reseat "
+                "the ribbon at both ends.")
+    return "Camera present in dmesg but could not be opened; see the journal."
+
+
+# Serve in a DEGRADED state rather than dying when there is no camera.
+#
+# Dying meant systemd restarted us every ~70 s, each cycle burning ~10 s of Pi 3
+# CPU on a retry loop that could not possibly succeed -- a CSI sensor does not
+# appear without a reboot. Worse, the control panel showed "Pi unreachable",
+# which is actively misleading: the Pi is fine, reachable, and the only broken
+# thing is a ribbon cable. Staying up to say exactly that is more useful than
+# exiting, and it costs nothing.
+cam, CAMERA_ERROR, CAMERA_HINT = None, None, None
+try:
+    cam = Camera()
+except Exception as _e:
+    CAMERA_ERROR = str(_e)
+    CAMERA_HINT = _camera_fault_hint()
+    print(f"[camera] NOT AVAILABLE: {CAMERA_ERROR}\n[camera] {CAMERA_HINT}",
+          flush=True)
+
+
+def _no_camera():
+    return jsonify({"error": "no camera", "detail": CAMERA_ERROR,
+                    "hint": CAMERA_HINT}), 503
 
 
 # ------------------------------------------------------------- calibration ---
@@ -705,6 +938,28 @@ def load_quad():
         return None, None
     cfg = json.load(open(CONFIG))
     return np.array(cfg["quad"], np.float32).reshape(4, 2), cfg.get("frame")
+
+
+def _calibration_state(frame_size=None):
+    """Is there a tray calibration, and is it USABLE at the current frame size?
+
+    "The file exists" is not the same question. After the Camera Module 3 swap
+    the saved quad was still there and /health said calibrated, while /roll
+    refused every request because a 4:3 quad cannot be rescaled onto a 16:9
+    frame. A green pill telling the operator not to do the one thing they must
+    do is worse than no pill at all.
+    """
+    quad, qframe = load_quad()
+    if quad is None:
+        return False, None
+    if frame_size is None:
+        return True, None
+    try:
+        fit_quad_to_frame(quad, qframe or list(frame_size),
+                          (frame_size[1], frame_size[0]))
+        return True, None
+    except ValueError as e:
+        return False, str(e)
 
 
 @app.get("/calibration")
@@ -722,7 +977,7 @@ def set_calibration():
     quad = body.get("quad")
     if not quad or len(quad) != 4 or any(len(p) != 2 for p in quad):
         return jsonify({"error": "quad must be 4 [x,y] pairs"}), 400
-    frame = body.get("frame") or list(MAIN_SIZE)
+    frame = body.get("frame") or list(cam.main_size)
     os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
     json.dump({"quad": [[int(p[0]), int(p[1])] for p in quad],
                "frame": [int(frame[0]), int(frame[1])]},
@@ -734,26 +989,43 @@ def set_calibration():
 
 @app.get("/health")
 def health():
+    if cam is None:
+        # Answer, loudly and specifically. The control panel's "Pi unreachable"
+        # banner was the wrong diagnosis for a ribbon cable.
+        return jsonify({
+            "ok": False, "camera": False,
+            "error": CAMERA_ERROR, "hint": CAMERA_HINT,
+            "calibrated": _calibration_state()[0],
+            "work_dir": WORK, "work_source": WORK_SOURCE,
+            "free_mb": round(_free_mb()),
+        })
     f = cam.frame()
+    _cal_ok, _cal_why = _calibration_state(cam.main_size)
     return jsonify({
         "ok": f is not None,
-        "main_size": list(MAIN_SIZE),
+        "camera": True,
+        "sensor": cam.sensor,
+        "main_size": list(cam.main_size),
+        "focus": cam.focus_state(),
         "lores_size": list(LORES_SIZE),
         # cam.tuning_active is read back from picamera2 AFTER it opened the
         # camera, so it is the file libcamera was actually handed. The previous
         # version reported the environment variable we had set ourselves, which
         # reported success in precisely the case that silently failed -- it read
         # "NoIR active" for weeks while libcamera logged imx219.json.
-        "tuning_file": cam.tuning_active or "(libcamera default -- imx219.json)",
-        "noir_tuning_active": cam.tuning_active == NOIR_TUNING,
-        "tuning_warning": (None if cam.tuning_active == NOIR_TUNING else
-                           "Running on the IR-cut tuning. Captures are usable but "
-                           "lose ~0.14 Otsu separability and 46 grey levels of "
-                           "numeral contrast. Check that "
-                           f"{NOIR_TUNING} exists."),
+        "tuning_file": cam.tuning_active or "(libcamera default)",
+        "tuning_expected": cam.tuning_expected,
+        "tuning_ok": cam.tuning_active == cam.tuning_expected,
+        "tuning_warning": (None if cam.tuning_active == cam.tuning_expected else
+                           f"libcamera loaded {cam.tuning_active or 'its default'} "
+                           f"but this sensor ({cam.sensor}) should use "
+                           f"{cam.tuning_expected}. Captures are usable but the "
+                           f"colour pipeline is wrong, which costs numeral "
+                           f"contrast and does not announce itself."),
         "cma_free_mb": round(_cma_free_mb()),
         "controls": cam.controls(),
-        "calibrated": os.path.exists(CONFIG),
+        "calibrated": _cal_ok,
+        "calibration_warning": _cal_why,
         "work_dir": WORK,
         "work_source": WORK_SOURCE,
         "free_mb": round(_free_mb()),
@@ -764,6 +1036,8 @@ def health():
 
 @app.get("/stream")
 def stream():
+    if cam is None:
+        return _no_camera()
     def gen():
         while True:
             jpg = cam.preview_jpeg()
@@ -777,6 +1051,8 @@ def stream():
 
 @app.get("/snapshot.jpg")
 def snapshot():
+    if cam is None:
+        return _no_camera()
     f = cam.frame()
     if f is None:
         return jsonify({"error": "no frame yet"}), 503
@@ -786,6 +1062,8 @@ def snapshot():
 
 @app.post("/capture")
 def capture():
+    if cam is None:
+        return _no_camera()
     f = cam.frame()
     if f is None:
         return jsonify({"error": "no frame yet"}), 503
@@ -808,6 +1086,8 @@ def capture():
 
 @app.post("/lock")
 def do_lock():
+    if cam is None:
+        return _no_camera()
     c = cam.lock_exposure()
     return (jsonify({"locked": True, "controls": c}) if c
             else (jsonify({"error": "no metadata yet"}), 503))
@@ -815,6 +1095,8 @@ def do_lock():
 
 @app.post("/unlock")
 def do_unlock():
+    if cam is None:
+        return _no_camera()
     cam.unlock_exposure()
     return jsonify({"locked": False})
 
@@ -831,6 +1113,8 @@ def do_autoexpose():
     This searches for the brightest exposure at which the top of the DICE
     histogram still sits below saturation, and locks there.
     """
+    if cam is None:
+        return _no_camera()
     box = None
     quad, qframe = load_quad()
     if quad is not None:
@@ -839,8 +1123,8 @@ def do_autoexpose():
         # fixed -- and the desk here is a bright purple mat.
         try:
             w, h = LORES_SIZE
-            sx = w / float(qframe[0] if qframe else MAIN_SIZE[0])
-            sy = h / float(qframe[1] if qframe else MAIN_SIZE[1])
+            sx = w / float(qframe[0] if qframe else cam.main_size[0])
+            sy = h / float(qframe[1] if qframe else cam.main_size[1])
             xs, ys = quad[:, 0] * sx, quad[:, 1] * sy
             box = (max(0, int(xs.min())), max(0, int(ys.min())),
                    min(w, int(xs.max())), min(h, int(ys.max())))
@@ -858,9 +1142,48 @@ def do_autoexpose():
                     "controls": cam.controls()})
 
 
+@app.get("/focus")
+def get_focus():
+    if cam is None:
+        return _no_camera()
+    return jsonify(cam.focus_state())
+
+
+@app.post("/focus")
+def put_focus():
+    """Pin the lens. {"lens_position": 4.8}  -- dioptres, i.e. 1/metres.
+
+    The tray floor sits ~207 mm below the lens, so ~4.8 is the expected value.
+    """
+    if cam is None:
+        return _no_camera()
+    if not cam.has_focus():
+        return jsonify({"error": "this camera has no motorised lens"}), 400
+    b = request.get_json(silent=True) or {}
+    if b.get("lens_position") is None:
+        return jsonify({"error": "lens_position (dioptres) required"}), 400
+    try:
+        return jsonify(cam.set_focus(b["lens_position"]))
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": f"bad value: {e}"}), 400
+
+
+@app.post("/autofocus")
+def do_autofocus():
+    """One AF sweep on the tray, then pin it. Never left on continuous."""
+    if cam is None:
+        return _no_camera()
+    if not cam.has_focus():
+        return jsonify({"error": "this camera has no motorised lens"}), 400
+    r = cam.autofocus()
+    return (jsonify(r), 500) if r.get("error") else jsonify(r)
+
+
 @app.get("/exposure")
 def get_exposure():
     """Current settings plus the sensor's real ranges, for a UI to bound itself."""
+    if cam is None:
+        return _no_camera()
     return jsonify({"controls": cam.controls(), "limits": cam.limits()})
 
 
@@ -879,6 +1202,8 @@ def set_exposure():
 
     Returns what the sensor ACTUALLY applied, not what was asked for.
     """
+    if cam is None:
+        return _no_camera()
     b = request.get_json(silent=True) or {}
     cg = b.get("colour_gains")
     if cg is not None and (not isinstance(cg, (list, tuple)) or len(cg) != 2):
@@ -920,6 +1245,8 @@ def roll():
     So: crop and hand over the image. Nothing here is on the accuracy path any
     more, which is why nothing here needs to be fast or clever.
     """
+    if cam is None:
+        return _no_camera()
     img = cam.frame()
     if img is None:
         return jsonify({"error": "no frame yet"}), 503
@@ -928,7 +1255,7 @@ def roll():
     if quad is None:
         return jsonify({"error": "not calibrated -- set the tray quad first"}), 400
     try:
-        quad, _ = fit_quad_to_frame(quad, qframe or list(MAIN_SIZE), img.shape)
+        quad, _ = fit_quad_to_frame(quad, qframe or list(cam.main_size), img.shape)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
@@ -964,6 +1291,8 @@ def roll():
 @app.get("/framing")
 def framing():
     """Brightness + sharpness uniformity across the tray, for mount tuning."""
+    if cam is None:
+        return _no_camera()
     img = cam.frame()
     if img is None:
         return jsonify({"error": "no frame yet"}), 503
@@ -971,7 +1300,7 @@ def framing():
     if quad is None:
         return jsonify({"error": "not calibrated"}), 400
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    quad, _ = fit_quad_to_frame(quad, qframe or list(MAIN_SIZE), gray.shape)
+    quad, _ = fit_quad_to_frame(quad, qframe or list(cam.main_size), gray.shape)
 
     q = np.asarray(quad, np.float32)
     s, d = q.sum(axis=1), np.diff(q, axis=1).ravel()
@@ -1021,10 +1350,17 @@ if __name__ == "__main__":
     # Log the tuning loudly, and say so when it is wrong. This line reads back
     # what picamera2 actually gave libcamera; the version that printed our own
     # environment variable said "noir" while libcamera loaded imx219.json.
-    if cam.tuning_active == NOIR_TUNING:
+    if cam.tuning_active == cam.tuning_expected:
+        print(f"sensor: {cam.sensor} at {cam.main_size[0]}x{cam.main_size[1]}",
+              flush=True)
         print(f"tuning: {cam.tuning_active}", flush=True)
     else:
-        print(f"tuning: {cam.tuning_active} -- NOT the NoIR tuning; captures "
-              f"will lose numeral contrast", flush=True)
+        print(f"tuning: {cam.tuning_active} -- EXPECTED {cam.tuning_expected}; "
+              f"the colour pipeline is wrong", flush=True)
+    f = cam.focus_state()
+    if f.get("supported"):
+        print(f"focus : {f.get('lens_position')} dioptres"
+              f"{'' if f.get('pinned') else '  (NOT PINNED -- run /autofocus)'}",
+              flush=True)
     print(f"work dir: {WORK} ({WORK_SOURCE}, {_free_mb():.0f} MB free)", flush=True)
     app.run(host="0.0.0.0", port=8081, threaded=True)
