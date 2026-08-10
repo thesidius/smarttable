@@ -339,6 +339,12 @@ class Camera:
         self.frame_seq = 0
         self.meta = {}
         self.locked = False
+        # Exposure changes must not overlap a capture, or the frame is taken
+        # mid-sweep at whatever brightness the search happened to be probing.
+        # A separate lock from self.lock, which guards the frame buffers and is
+        # held for microseconds -- this one is held for the length of a sweep.
+        self.expo_lock = threading.Lock()
+        self.remetering = False
         self.focus_pinned = None
         self.focus_sharpness = None
         self.mode = None                   # None | "auto-lock" | "manual"
@@ -865,6 +871,34 @@ class Camera:
     # whether the dice faces are about to clip, or have sunk into the mud.
     OK_TOP_LO, OK_TOP_HI = 200.0, 251.0
 
+    def remeter_async(self, box=None):
+        """Re-meter in the background. Returns True if a run was started.
+
+        The point is that the caller does NOT wait. A sweep costs 20-60 s
+        against about a second for a roll, so doing it before the capture makes
+        every drifted roll feel broken. Doing it after means this roll returns
+        the frame it already has -- flagged as poorly exposed -- and the
+        correction lands on the next one.
+        """
+        if self.remetering:
+            return False
+        self.remetering = True
+
+        def run():
+            try:
+                with self.expo_lock:
+                    r, notes = self.autoexpose(box=box)
+                a = (r or {}).get("applied") or {}
+                print(f"[camera] background re-meter done: {a.get('exposure_us')} us "
+                      f"gain {a.get('analogue_gain')}", flush=True)
+            except Exception as e:
+                print(f"[camera] background re-meter failed: {e}", flush=True)
+            finally:
+                self.remetering = False
+
+        threading.Thread(target=run, daemon=True).start()
+        return True
+
     def exposure_health(self, box=None):
         """Is the current exposure still good for reading? (verdict, detail)."""
         m = self._meter(box)
@@ -1226,6 +1260,7 @@ def health():
                            f"colour pipeline is wrong, which costs numeral "
                            f"contrast and does not announce itself."),
         "cma_free_mb": round(_cma_free_mb()),
+        "remetering": cam.remetering,
         "controls": cam.controls(),
         "calibrated": _cal_ok,
         "calibration_warning": _cal_why,
@@ -1479,32 +1514,12 @@ def roll():
         return _no_camera()
     body = request.get_json(silent=True) or {}
 
-    # Re-meter when the light has moved, BEFORE capturing.
-    #
-    # A locked exposure is only valid for the light it was taken under, and a
-    # session drifts: metered at 240 lux, by the next roll the room was at 87
-    # and the frame came back at mean level 31. The reverse also happened --
-    # light doubled and a capture came out 2.6% clipped, a hundred times the
-    # 0.02% highlight metering achieves. Both were silent.
-    #
-    # Triggered on measured brightness rather than on the lux reading, because
-    # the question is not "has the light changed" but "are the dice still
-    # exposed properly", and one lores frame answers that directly.
-    remeter = body.get("remeter", "auto")
-    remetered = None
-    if cam.locked and remeter is not False:
-        box = _metering_box()
-        verdict, detail = cam.exposure_health(box)
-        if remeter == "force" or verdict in ("bright", "dark"):
-            r, notes = cam.autoexpose(box=box)
-            remetered = {"was": verdict, "detail": detail,
-                         "applied": (r or {}).get("applied"), "notes": notes}
-            print(f"[camera] re-metered before roll: dice top {detail.get('top')} "
-                  f"was {verdict}", flush=True)
-        else:
-            remetered = False
-
-    img = cam.frame()
+    # Never capture mid-sweep. A background re-meter walks the exposure across
+    # its whole range, so a frame grabbed while one is running is taken at an
+    # arbitrary brightness. Waiting here costs nothing in the common case --
+    # the lock is uncontended unless a re-meter is actually in flight.
+    with cam.expo_lock:
+        img = cam.frame()
     if img is None:
         return jsonify({"error": "no frame yet"}), 503
 
@@ -1536,14 +1551,35 @@ def roll():
     except IOError as e:
         return jsonify({"error": str(e)}), 507
 
+    # Now that the frame is safely captured and written, judge the exposure and
+    # fix it for NEXT time. Correcting before the capture was right in principle
+    # and wrong in practice: it made every drifted roll wait 20-60 s for a sweep
+    # before returning a frame, when the frame was already available.
+    #
+    # The cost is that THIS capture keeps whatever exposure it had, so say so
+    # plainly. A caller that cares can look at exposure_ok and re-roll; one that
+    # does not gets its frame in about a second either way.
+    remeter = body.get("remeter", "auto")
+    verdict, detail = (None, {})
+    started = False
+    if cam.locked and remeter is not False:
+        box = _metering_box()
+        verdict, detail = cam.exposure_health(box)
+        if remeter == "force" or verdict in ("bright", "dark"):
+            started = cam.remeter_async(box)
+
     return jsonify({
         "id": stamp,
         "tray_image": name,
         "tray_box": [x0, y0, x1, y1],
         "size": [crop.shape[1], crop.shape[0]],
-        # Callers need to know the exposure moved: templates and any stored
-        # reference are only valid for the settings they were captured under.
-        "remetered": remetered,
+        # This capture's own exposure quality -- not a promise about the next.
+        "exposure_ok": None if verdict is None else verdict == "ok",
+        "exposure": {"verdict": verdict, **detail},
+        # A correction is running; the NEXT roll gets it. Anything keyed to the
+        # exposure -- templates especially -- is about to be against new
+        # settings, so this must not be silent.
+        "remetering": started,
         "controls": cam.controls(),
     })
 

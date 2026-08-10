@@ -99,9 +99,30 @@ by the next capture the room was at 87 and the frame came back at mean level
 31; and earlier the light doubled and a capture came out **2.6% clipped**, a
 hundred times what highlight metering achieves. Both silent.
 
-`/roll` now checks before capturing and re-meters if the dice are out of band,
-reporting `remetered` in the response so nothing downstream is surprised by a
-changed exposure. `{"remeter": false}` opts out, `"force"` always re-meters.
+`/roll` judges the exposure **after** capturing and, if the dice are out of
+band, starts a correction in the background for the NEXT roll. Correcting
+first was right in principle and wrong in practice: a sweep costs 20-60 s
+against about a second for a roll, so every drifted roll felt broken while the
+frame it wanted was already available.
+
+The cost is that the capture keeps whatever exposure it had, so the response
+says so: `exposure_ok` is about that frame, `remetering` says a correction is
+running. `{"remeter": false}` opts out, `"force"` always re-meters.
+
+Measured, with the exposure deliberately cut 8x:
+
+| | time | exposure_ok | dice top |
+|---|---|---|---|
+| roll 1 | 1.06 s | false | 106 |
+| roll 2 | 0.99 s | true | 244 |
+| roll 3 | 0.99 s | true | 244 |
+
+**A roll arriving mid-sweep waits rather than capturing.** A sweep walks the
+exposure across its whole range, so a frame grabbed during one is taken at an
+arbitrary brightness -- worse than a stale exposure, because it is not
+reproducible. `expo_lock` serialises the two: measured, a roll fired 4 s into a
+sweep blocked 27.3 s and returned a correctly exposed frame. Uncontended the
+lock costs nothing.
 
 **Triggered on measured brightness, not on the lux reading.** The question is
 not "has the light changed" but "are the dice still exposed properly", and one
