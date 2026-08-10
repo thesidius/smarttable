@@ -1104,8 +1104,38 @@ def get_calibration():
     quad, frame = load_quad()
     if quad is None:
         return jsonify({"calibrated": False, "quad": None, "frame": None})
-    return jsonify({"calibrated": True, "quad": quad.astype(int).tolist(),
+    try:
+        saved = json.load(open(CONFIG))
+    except Exception:
+        saved = {}
+    extra = {k: saved.get(k) for k in ("feature", "square_mm", "height_mm", "saved")}
+    if extra["feature"] is None:
+        # Pre-dates the field. Say so rather than defaulting, because a wrong
+        # guess here silently rescales everything downstream.
+        extra["warning"] = ("this calibration predates the feature field, so "
+                            "what was clicked is unknown -- recalibrate")
+    return jsonify({"calibrated": True, **extra, "quad": quad.astype(int).tolist(),
                     "frame": frame})
+
+
+# What the four corners ARE, not just where they are.
+#
+# The tray has two obvious square features and the calibration used to record
+# only pixels, so every consumer had to guess which one had been clicked. That
+# guess was wrong three times in one session: once read as the 95 mm floor when
+# it was the walls, once the reverse, and once silently carried across a
+# re-click that switched features. Each time it scaled every derived millimetre
+# and nothing errored.
+#
+# Geometric face reading needs the plane the dice REST on, so the floor is the
+# right feature for it -- the wall square sits ~10 mm higher, and that offset
+# goes straight into every predicted position.
+FEATURES = {
+    "floor": {"square_mm": 95.0, "height_mm": 0.0,
+              "desc": "flat floor, inside the 45 degree skirt"},
+    "walls": {"square_mm": 115.0, "height_mm": 10.0,
+              "desc": "top of the skirt where it meets the vertical wall"},
+}
 
 
 @app.post("/calibration")
@@ -1114,12 +1144,21 @@ def set_calibration():
     quad = body.get("quad")
     if not quad or len(quad) != 4 or any(len(p) != 2 for p in quad):
         return jsonify({"error": "quad must be 4 [x,y] pairs"}), 400
+    feature = body.get("feature", "floor")
+    if feature not in FEATURES:
+        return jsonify({"error": f"feature must be one of {list(FEATURES)}"}), 400
+    spec = FEATURES[feature]
     frame = body.get("frame") or list(cam.main_size)
+    rec = {"quad": [[int(p[0]), int(p[1])] for p in quad],
+           "frame": [int(frame[0]), int(frame[1])],
+           "feature": feature,
+           # Overridable: these are this tray's measurements, not constants.
+           "square_mm": float(body.get("square_mm") or spec["square_mm"]),
+           "height_mm": float(body.get("height_mm", spec["height_mm"])),
+           "saved": time.strftime("%Y-%m-%dT%H:%M:%S")}
     os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
-    json.dump({"quad": [[int(p[0]), int(p[1])] for p in quad],
-               "frame": [int(frame[0]), int(frame[1])]},
-              open(CONFIG, "w"), indent=2)
-    return jsonify({"saved": True, "path": CONFIG, "quad": quad, "frame": frame})
+    json.dump(rec, open(CONFIG, "w"), indent=2)
+    return jsonify({"saved": True, "path": CONFIG, **rec})
 
 
 # ------------------------------------------------------------------ frames ---

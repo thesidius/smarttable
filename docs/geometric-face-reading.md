@@ -339,6 +339,46 @@ order asked for 20. Cocked dice, dice touching, and dice against the tray wall
 are all untested, and §8 expects the derivation to fail on them -- detecting
 that failure is §7's job and is not built yet.
 
+## 2e — Gate re-run on a second set (2026-08-09)
+
+Repeat of the gate on a different roll, a different dice set, and a third
+lighting condition, with the calibration now self-describing.
+
+    calibration: floor 95 mm at +0 mm | camera 186 mm, tilt 21.9 deg
+    (the previous floor calibration independently gave 188 mm)
+
+| id | called | IoU | runner-up | margin | 2r mm | on the top face |
+|---|---|---|---|---|---|---|
+| 2 | d20 | 0.956 | d12 | +0.031 | 20.0 | yes |
+| 5 | d4 | 0.955 | d6 | +0.151 | 9.4 | n/a -- no top face |
+| 6 | d6 | 0.958 | d20 | +0.049 | 19.3 | yes |
+| 8 | d6 | 0.907 | d12 | +0.019 | 15.3 | yes |
+| 9 | d12 | 0.946 | d20 | +0.009 | 17.7 | yes |
+| 10 | d20 | 0.949 | d12 | +0.027 | 19.9 | yes |
+| 11 | d8 | 0.908 | d20 | +0.008 | 15.1 | yes |
+
+**Top-face localisation: 6/6 again.** Fourteen dice across two sets, two
+calibrations and three lighting conditions, with no miss.
+
+**Type: 5 of 7.** Both failures are d10-family -- id 2 is very likely a d10
+called a d20, and id 8 is the percentile d% called a d6. That is where the
+model is weakest and it is not a surprise: unlike the Platonic solids a
+pentagonal trapezohedron has no canonical proportion, so `_trapez10_v` picks
+its squatness by eye. Fixing it needs a d10 measured with calipers, the same
+anchor treatment the d20 got.
+
+### The useful finding: localisation is robust to getting the type wrong
+
+Ids 2 and 8 were typed wrongly and their top-face centres still landed on the
+correct face. That follows from the geometry -- every one of these solids puts
+its top face centre at 2r directly above its base centre, and r is fitted to
+match the observed silhouette, so a wrong-type fit still recovers roughly the
+right height. The two stages fail independently, which is worth knowing: type
+errors do not automatically become reading errors.
+
+Also incidental but reassuring: this frame was dark (mean level 31, the light
+having dropped to 87 lux mid-session) and the fits held.
+
 ## 3 — Speed
 
 Measured, single CPU core, all 20 templates correlated in one batched FFT:

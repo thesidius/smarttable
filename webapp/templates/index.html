@@ -93,10 +93,28 @@
 
     <div class="card">
       <h2>Tray calibration</h2>
-      <p class="note" style="margin-top:0">Click the four corners of the tray
-        <b>floor</b>, in any order. Auto-detection is not used: a dark matte tray
-        on a dark desk spans ~14 grey levels, which defeats it. The camera is
-        fixed once mounted, so this is a one-time measurement.</p>
+      <div class="row" style="margin-bottom:8px">
+        <label class="sl" style="margin:0">which square</label>
+        <select id="calFeature" style="background:#0e1116;color:var(--ink);border:1px solid var(--edge);border-radius:6px;padding:6px">
+          <option value="floor">flat floor (95 mm, the plane dice rest on)</option>
+          <option value="walls">top of the skirt (115 mm, 10 mm up)</option>
+        </select>
+        <label class="sl" style="margin:0">size mm</label>
+        <input id="calSquare" value="95" autocomplete="off" data-1p-ignore
+               style="width:74px;background:#0e1116;color:var(--ink);border:1px solid var(--edge);border-radius:6px;padding:5px">
+      </div>
+      <p class="note" style="margin-top:0">Click the four corners in any order.
+        Auto-detection does not work here &mdash; SAM2 merges the floor with the
+        desk (30&ndash;50% of the frame) and a flood fill leaks out of the tray
+        entirely, because floor and desk are the same tone with a continuous
+        path between them over the wall.</p>
+      <p class="note"><b>Say which square you clicked.</b> The tray has two
+        obvious ones and the calibration used to store only pixels, so every
+        consumer had to guess. That guess was wrong three times in one session,
+        and each time it silently rescaled every derived millimetre. Geometric
+        face reading needs the <b>floor</b>, because that is the plane the dice
+        rest on; the skirt top sits 10 mm higher and that offset goes straight
+        into every predicted position.</p>
       <div class="row" style="margin:9px 0">
         <button class="act p" onclick="loadCal()">load snapshot</button>
         <button class="act" onclick="clearPts()">clear points</button>
@@ -456,6 +474,7 @@ async function loadCal(){
   const cur = await piGet('calibration');
   if (cur.calibrated) document.getElementById('saveCal').textContent = 'save (0/4) — replaces existing';
 }
+calFeature.onchange = () => { calSquare.value = calFeature.value === 'floor' ? '95' : '115'; };
 calCv.onclick = e => {
   if (pts.length >= 4) return;
   const r = calCv.getBoundingClientRect();
@@ -480,7 +499,9 @@ async function saveCal(){
   // if it is ever applied to a different capture resolution.
   const sx = calNat[0]/calCv.width, sy = calNat[1]/calCv.height;
   const quad = pts.map(p => [Math.round(p[0]*sx), Math.round(p[1]*sy)]);
-  const r = await piPost('calibration', {quad, frame: calNat});
+  const r = await piPost('calibration', {quad, frame: calNat,
+                          feature: calFeature.value,
+                          square_mm: parseFloat(calSquare.value)});
   document.getElementById('saveCal').textContent = r.saved ? 'saved ✓' : 'failed';
   refreshStatus();
 }

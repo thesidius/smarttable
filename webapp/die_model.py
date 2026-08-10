@@ -29,12 +29,59 @@ def _cube_v():
 def _octa_v():
     return np.array([[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]], float)
 
+def _octa_v():
+    return np.array([[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]], float)
+
+
+def _tetra_v():
+    return np.array([[1,1,1],[1,-1,-1],[-1,1,-1],[-1,-1,1]], float)
+
+
+def _trapez10_v(a=0.36):
+    """Pentagonal trapezohedron -- the d10 and d%.
+
+    Two rings of five, staggered by 36 degrees, plus two apexes. The apex height
+    is not free: each kite face must be planar, which pins it given the ring
+    height. Solved numerically rather than quoted, so changing `a` stays valid.
+
+    `a` itself sets how squat the solid is and is chosen to match a real d10
+    (roughly as tall as it is wide). Approximate -- unlike the Platonic solids
+    there is no canonical proportion, and manufacturers differ.
+    """
+    ang_u = np.arange(5) * 2*np.pi/5
+    ang_l = ang_u + np.pi/5
+    up = np.stack([np.cos(ang_u), np.sin(ang_u), np.full(5, a)], 1)
+    lo = np.stack([np.cos(ang_l), np.sin(ang_l), np.full(5, -a)], 1)
+
+    def planar_err(c):
+        A = np.array([0.0, 0.0, c])
+        return float(np.linalg.det(np.stack([up[0]-A, lo[0]-A, up[1]-A])))
+    c0, c1 = a + 1e-4, 12.0
+    for _ in range(200):                       # bisect for a planar kite
+        mid = (c0 + c1) / 2
+        if planar_err(c0) * planar_err(mid) <= 0:
+            c1 = mid
+        else:
+            c0 = mid
+    c = (c0 + c1) / 2
+    return np.vstack([up, lo, [[0, 0, c], [0, 0, -c]]])
+
+
 SOLIDS = {
-    # verts, dual whose vertices give candidate face normals, vertices per face
-    "d20": (_icosa_v, _dodeca_v, 3),
-    "d12": (_dodeca_v, _icosa_v, 5),
-    "d6":  (_cube_v, _octa_v, 4),
+    # verts, (unused, kept for reference), vertices per face
+    "d20": (_icosa_v, None, 3),
+    "d12": (_dodeca_v, None, 5),
+    "d6":  (_cube_v, None, 4),
+    "d8":  (_octa_v, None, 3),
+    "d10": (_trapez10_v, None, 4),
+    # A tetrahedron rests on a face with a VERTEX up -- there is no top face, so
+    # the 2r derivation has nothing to point at. Modelled anyway, because
+    # fitting it still identifies and measures the die; only the top-face
+    # prediction is meaningless. See the doc's per-type notes.
+    "d4":  (_tetra_v, None, 3),
 }
+
+NO_TOP_FACE = {"d4"}
 
 
 def _face_normal(v, per_face):
