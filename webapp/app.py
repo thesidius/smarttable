@@ -490,6 +490,7 @@ def roll_phase1():
         "raw": raw,
         "seconds": round(time.time() - t0, 2),
         "capture": {"id": pi.get("id"), "tray_image": pi.get("tray_image"),
+                    "remetered": pi.get("remetered"),
                     "controls": pi.get("controls")},
     }
     with open(ROLLS, "a") as f:
@@ -544,6 +545,10 @@ def segment_only():
         "seconds": round(time.time() - t0, 2),
         "capture": {"id": pi.get("id"), "tray_image": pi.get("tray_image"),
                     "size": pi.get("size"), "controls": pi.get("controls"),
+                    # Surfaced, not swallowed: a re-meter means the exposure
+                    # changed under this capture, which invalidates anything
+                    # keyed to the previous settings -- templates especially.
+                    "remetered": pi.get("remetered"),
                     "work_source": pi.get("controls", {}).get("work_source")},
     })
 

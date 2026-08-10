@@ -91,6 +91,30 @@ Four buttons on the Mount tab.
 | **lock where AE lands** | Freeze whatever ordinary auto-exposure converged to. |
 | **release to AE** | Free-running AE/AWB. Drifts, so captures are not comparable. |
 
+### A roll re-meters itself when the light has drifted
+
+A locked exposure is only valid for the light it was taken under, and a session
+drifts. Both directions were observed within an hour: metered at 240 lux, and
+by the next capture the room was at 87 and the frame came back at mean level
+31; and earlier the light doubled and a capture came out **2.6% clipped**, a
+hundred times what highlight metering achieves. Both silent.
+
+`/roll` now checks before capturing and re-meters if the dice are out of band,
+reporting `remetered` in the response so nothing downstream is surprised by a
+changed exposure. `{"remeter": false}` opts out, `"force"` always re-meters.
+
+**Triggered on measured brightness, not on the lux reading.** The question is
+not "has the light changed" but "are the dice still exposed properly", and one
+preview frame answers that directly. The band is the 99.5th percentile inside
+the tray landing in 200-251, on the same measure highlight metering targets.
+An empty tray reads as `empty` rather than `dark`, so it never re-meters
+against noise.
+
+Measured: exposure cut 6x -> dice top 61, flagged dark, corrected. Raised 8x ->
+top 255, flagged bright, corrected. All paths converge on the same 85837 us.
+Three consecutive rolls after that re-metered zero times at ~1 s each, so the
+check is free when nothing is wrong.
+
 ### Highlight-priority metering: `POST /autoexpose`
 
 Ordinary AE meters the whole frame. The tray floor is most of that frame and it

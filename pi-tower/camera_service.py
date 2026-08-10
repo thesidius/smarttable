@@ -28,7 +28,7 @@ Endpoints:
     GET  /stream                  multipart MJPEG preview
     GET  /snapshot.jpg            single full-res JPEG (calibration clicking)
     POST /capture                 freeze a frame, returns its id
-    POST /roll                    capture + crop to the tray
+    POST /roll                    capture + crop; re-meters if the light drifted
     GET  /framing                 tray framing report
     GET  /calibration             read tray quad
     POST /calibration             write tray quad
@@ -858,6 +858,33 @@ class Camera:
                 float(np.median(y)),
                 100.0 * float(np.mean(y >= 254)))
 
+    # Bands for "still correctly exposed", on the same 99.5th-percentile
+    # measure highlight metering targets. Direct evidence beats the lux proxy:
+    # lux is the ISP's estimate of scene illuminance and moves with things that
+    # do not matter here, while this measures the quantity actually at stake --
+    # whether the dice faces are about to clip, or have sunk into the mud.
+    OK_TOP_LO, OK_TOP_HI = 200.0, 251.0
+
+    def exposure_health(self, box=None):
+        """Is the current exposure still good for reading? (verdict, detail)."""
+        m = self._meter(box)
+        if m is None:
+            return None, {"reason": "no frame"}
+        top, floor, clipped = m
+        if top - floor < 20:
+            # Nothing bright in the tray. An empty tray is not a bad exposure,
+            # and re-metering on it would lock to noise.
+            return "empty", {"top": round(top, 1), "floor": round(floor, 1)}
+        if top > self.OK_TOP_HI:
+            v = "bright"
+        elif top < self.OK_TOP_LO:
+            v = "dark"
+        else:
+            v = "ok"
+        return v, {"top": round(top, 1), "floor": round(floor, 1),
+                   "clipped_pct": round(clipped, 3),
+                   "band": [self.OK_TOP_LO, self.OK_TOP_HI]}
+
     def autoexpose(self, box=None, gain=None, _retry=False):
         """Brightest exposure that keeps the dice faces unsaturated, then lock.
 
@@ -1277,6 +1304,26 @@ def do_unlock():
     return jsonify({"locked": False})
 
 
+def _metering_box():
+    """Tray region in lores coordinates, or None if uncalibrated.
+
+    Metering has to be confined to the tray. Without it the search meters the
+    desk, which is the very mistake highlight metering exists to fix.
+    """
+    quad, qframe = load_quad()
+    if quad is None or cam is None:
+        return None
+    try:
+        w, h = cam.lores_size
+        sx = w / float(qframe[0] if qframe else cam.main_size[0])
+        sy = h / float(qframe[1] if qframe else cam.main_size[1])
+        xs, ys = quad[:, 0] * sx, quad[:, 1] * sy
+        return (max(0, int(xs.min())), max(0, int(ys.min())),
+                min(w, int(xs.max())), min(h, int(ys.max())))
+    except Exception:
+        return None
+
+
 @app.post("/autoexpose")
 def do_autoexpose():
     """Expose for the DICE, not for the tray, then lock.
@@ -1291,22 +1338,7 @@ def do_autoexpose():
     """
     if cam is None:
         return _no_camera()
-    box = None
-    quad, qframe = load_quad()
-    if quad is not None:
-        # Metering region in lores coordinates. Without this the search would
-        # meter the desk around the tray, which is exactly the mistake being
-        # fixed -- and the desk here is a bright purple mat.
-        try:
-            w, h = cam.lores_size
-            sx = w / float(qframe[0] if qframe else cam.main_size[0])
-            sy = h / float(qframe[1] if qframe else cam.main_size[1])
-            xs, ys = quad[:, 0] * sx, quad[:, 1] * sy
-            box = (max(0, int(xs.min())), max(0, int(ys.min())),
-                   min(w, int(xs.max())), min(h, int(ys.max())))
-        except Exception:
-            box = None
-
+    box = _metering_box()
     body = request.get_json(silent=True) or {}
     try:
         result, notes = cam.autoexpose(box=box, gain=body.get("analogue_gain"))
@@ -1445,6 +1477,33 @@ def roll():
     """
     if cam is None:
         return _no_camera()
+    body = request.get_json(silent=True) or {}
+
+    # Re-meter when the light has moved, BEFORE capturing.
+    #
+    # A locked exposure is only valid for the light it was taken under, and a
+    # session drifts: metered at 240 lux, by the next roll the room was at 87
+    # and the frame came back at mean level 31. The reverse also happened --
+    # light doubled and a capture came out 2.6% clipped, a hundred times the
+    # 0.02% highlight metering achieves. Both were silent.
+    #
+    # Triggered on measured brightness rather than on the lux reading, because
+    # the question is not "has the light changed" but "are the dice still
+    # exposed properly", and one lores frame answers that directly.
+    remeter = body.get("remeter", "auto")
+    remetered = None
+    if cam.locked and remeter is not False:
+        box = _metering_box()
+        verdict, detail = cam.exposure_health(box)
+        if remeter == "force" or verdict in ("bright", "dark"):
+            r, notes = cam.autoexpose(box=box)
+            remetered = {"was": verdict, "detail": detail,
+                         "applied": (r or {}).get("applied"), "notes": notes}
+            print(f"[camera] re-metered before roll: dice top {detail.get('top')} "
+                  f"was {verdict}", flush=True)
+        else:
+            remetered = False
+
     img = cam.frame()
     if img is None:
         return jsonify({"error": "no frame yet"}), 503
@@ -1482,6 +1541,9 @@ def roll():
         "tray_image": name,
         "tray_box": [x0, y0, x1, y1],
         "size": [crop.shape[1], crop.shape[0]],
+        # Callers need to know the exposure moved: templates and any stored
+        # reference are only valid for the settings they were captured under.
+        "remetered": remetered,
         "controls": cam.controls(),
     })
 
